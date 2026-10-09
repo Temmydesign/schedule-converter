@@ -13,6 +13,7 @@
   "group_summary_prefix_from_column_header": true,
 
   "calendar_name_suffix": " CALENDAR",
+  "calendar_name_max_length": 51,
   "working_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
   "hours_per_day": 8,
   "day_start": "08:00",
