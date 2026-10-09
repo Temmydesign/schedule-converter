@@ -20,6 +20,8 @@
   "day_finish": "17:00",
   "lunch_break": ["12:00", "13:00"],
 
+  "p6_xer_version": "19.12",
+
   "max_lead_weeks": 2,
   "close_open_ends": false,
   "kickoff_link_type": "SS",
