@@ -139,6 +139,7 @@ def to_mspdi(res, author: str = "Naphtali PM Group") -> bytes:
     sub(P, "WeekStartDay", 1)
     sub(P, "CurrentDate", now)
     sub(P, "NewTaskStartDate", 0)
+    sub(P, "NewTasksAreManual", 0)
 
     # ---- calendar (firm policy: '<Project name> CALENDAR') ---- #
     cals = sub(P, "Calendars")
@@ -184,6 +185,7 @@ def to_mspdi(res, author: str = "Naphtali PM Group") -> bytes:
     sub(t0, "DurationFormat", 7)
     sub(t0, "Milestone", 0)
     sub(t0, "Summary", 1)
+    sub(t0, "RemainingDuration", _dur_iso(proj_ef, hpd))
 
     for n in res.nodes:
         t = sub(tasks, "Task")
@@ -208,10 +210,21 @@ def to_mspdi(res, author: str = "Naphtali PM Group") -> bytes:
             sub(t, "Finish", finish_dt(n.ef))
         sub(t, "Duration", _dur_iso(n.dur, hpd))
         sub(t, "DurationFormat", 9 if (n.dur_unit == "w" and n.dur % 5 == 0) else 7)
+        sub(t, "ResumeValid", 0)
         sub(t, "EffortDriven", 0)
+        sub(t, "Recurring", 0)
+        sub(t, "OverAllocated", 0)
         sub(t, "Estimated", 0)
         sub(t, "Milestone", 1 if n.is_milestone else 0)
         sub(t, "Summary", 1 if n.is_summary else 0)
+        sub(t, "Critical", 0)
+        sub(t, "IsSubproject", 0)
+        sub(t, "IsSubprojectReadOnly", 0)
+        sub(t, "ExternalTask", 0)
+        sub(t, "FixedCostAccrual", 3)
+        # MS Project imports Duration as ActualDuration + RemainingDuration:
+        # without RemainingDuration every task would come in as 0 days.
+        sub(t, "RemainingDuration", _dur_iso(n.dur, hpd))
         sub(t, "ConstraintType", 0)
         sub(t, "CalendarUID", -1)
         if n.src is not None:
