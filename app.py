@@ -14,8 +14,10 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from scheduler import exporters
-from scheduler.engine import Options, apply_edited_predecessors, calendar_name_for, convert
+from scheduler.engine import (NoScheduleFound, Options, apply_edited_predecessors, calendar_name_for, convert,
+                              inspect_layout)
 from scheduler.model import load_policy
+from scheduler.reader import col_letter, read_sheets
 
 APP_NAME = "Schedule Converter"
 POLICY = load_policy()
@@ -153,6 +155,9 @@ with st.sidebar:
                             help="Add '<project> completed' under the project title.")
         use_src = st.toggle("Use workbook predecessors", value=True,
                             help="If the workbook already has a Predecessors column, keep its logic.")
+        fit_src = st.toggle("Fit workbook links to its dates", value=True,
+                            help="Adjust link type/lag only where the workbook's own links contradict its dates, "
+                                 "so nothing moves. Every change is listed in File check.")
     with st.expander("Calendar", icon=":material/calendar_month:"):
         week_choice = st.selectbox("Work week", ["Auto-detect", "Mon–Fri", "Mon–Sat", "Mon–Sun"],
                                    help="Auto-detect reads weekend dates, durations and wording in the workbook.")
@@ -182,21 +187,83 @@ if up is None:
                 '<div class="sc-step"><span class="n">2</span>Check the dates</div>'
                 '<div class="sc-step"><span class="n">3</span>Download your files</div></div>',
                 unsafe_allow_html=True)
+    st.write("")
+    t1, _ = st.columns([1, 3])
+    t1.download_button("Blank schedule template", exporters.blank_template_xlsx(), "Schedule_Template.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       icon=":material/description:", width="stretch",
+                       help="The standard layout the app reads best. Any other layout works too.")
     footer()
     st.stop()
 
 data = up.getvalue()
 file_sig = hashlib.md5(data).hexdigest()
 
-base_opts = Options(dayfirst=dayfirst, holidays=holidays, use_source_logic=use_src,
-                    work_week=work_week, hours_per_day=hours,
+map_key = f"map-{file_sig}"
+mapping = st.session_state.get(map_key)
+
+FIELDS = [("name", "Activity name *"), ("start", "Start date"), ("finish", "Finish date"),
+          ("start_wk", "Start period no."), ("finish_wk", "Finish period no."), ("duration", "Duration"),
+          ("wbs", "WBS / outline code"), ("id", "Activity ID / S/N"), ("preds", "Predecessors"),
+          ("group", "Group / phase / system"), ("type", "Type (task, milestone, summary)")]
+
+
+def column_mapper(prefill=None, expanded_msg=None):
+    """Manual layout: user tells the app which column is which."""
+    layouts = inspect_layout(data, up.name)
+    if expanded_msg:
+        st.info(expanded_msg, icon=":material/table_view:")
+    names = [l["sheet"] for l in layouts]
+    pre_sheet = (prefill or {}).get("sheet") or names[0]
+    c1, c2, c3 = st.columns([2, 1, 1])
+    sh = c1.selectbox("Sheet", names, index=names.index(pre_sheet) if pre_sheet in names else 0, key="mp-sheet")
+    lay = layouts[names.index(sh)]
+    hr = c2.number_input("Header row", 1, max(lay["rows"], 1),
+                         int((prefill or {}).get("header_row") or lay["header_row"]), key=f"mp-hr-{sh}")
+    pu_opts = {"w": "Weeks", "mo": "Months", "d": "Days"}
+    pu = c3.selectbox("Period numbers are", list(pu_opts), format_func=pu_opts.get,
+                      index=list(pu_opts).index((prefill or {}).get("period_unit") or "w"), key="mp-pu",
+                      help="Only used if Start/Finish are period numbers (Week 1, Month 3 ...).")
+    if hr - 1 != lay["header_row"] - 1:
+        sheet_obj = next(s for s in read_sheets(data, up.name) if s.name == sh)
+        row_vals = sheet_obj.values[hr - 1] if hr - 1 < sheet_obj.nrows else []
+        lay_cols = [(c, f"{col_letter(c)}: {str(v).strip()}" if v not in (None, "") else col_letter(c))
+                    for c, v in enumerate(row_vals)]
+    else:
+        lay_cols = lay["columns"]
+    opts_cols = [None] + [c for c, _ in lay_cols]
+    labels = {None: "—"} | {c: lbl.replace("\n", " ")[:60] for c, lbl in lay_cols}
+    guess = (prefill or {}).get("cols") or lay["guess"]
+    chosen = {}
+    grid = st.columns(3)
+    for i, (k, lbl) in enumerate(FIELDS):
+        g = guess.get(k)
+        chosen[k] = grid[i % 3].selectbox(lbl, opts_cols, format_func=lambda c: labels.get(c, str(c)),
+                                         index=opts_cols.index(g) if g in opts_cols else 0, key=f"mp-{sh}-{k}")
+    b1, b2, _ = st.columns([1, 1, 3])
+    if b1.button("Convert with this mapping", type="primary", icon=":material/play_arrow:"):
+        st.session_state[map_key] = {"sheet": sh, "header_row": int(hr), "period_unit": pu,
+                                     "cols": {k: v for k, v in chosen.items() if v is not None}}
+        st.rerun()
+    if mapping and b2.button("Back to automatic", icon=":material/auto_fix:"):
+        st.session_state.pop(map_key, None)
+        st.rerun()
+
+
+base_opts = Options(dayfirst=dayfirst, holidays=holidays, use_source_logic=use_src, fit_source_logic=fit_src,
+                    work_week=work_week, hours_per_day=hours, mapping=mapping,
                     policy={"max_lead_weeks": max_lead, "close_open_ends": close_ends,
                             "completion_milestone_for_project_title": proj_ms})
 try:
     with st.spinner("Reading the schedule…"):
         probe = convert(data, up.name, base_opts)
+except NoScheduleFound as exc:
+    column_mapper(None, str(exc))
+    footer()
+    st.stop()
 except Exception as exc:  # noqa: BLE001
-    st.error(f"No schedule could be read from {up.name}. {exc}")
+    st.error(f"{up.name} couldn't be converted with this layout: {exc}", icon=":material/error:")
+    column_mapper(mapping, "Check the column mapping and try again.")
     footer()
     st.stop()
 
@@ -212,7 +279,8 @@ with st.expander("Project settings", icon=":material/tune:"):
                           help="Change to move the whole schedule to a new start date.")
     if sheet != probe.sheet_name:
         probe = convert(data, up.name, Options(sheet_name=sheet, dayfirst=dayfirst, holidays=holidays,
-                                               use_source_logic=use_src, policy=base_opts.policy,
+                                               use_source_logic=use_src, fit_source_logic=fit_src,
+                                               policy=base_opts.policy,
                                                work_week=work_week, hours_per_day=hours))
     name = st.text_input("Project name", probe.project.name)
     auto_cal = calendar_name_for(name, {**POLICY, **base_opts.policy})
@@ -220,7 +288,7 @@ with st.expander("Project settings", icon=":material/tune:"):
                              help="MS Project allows at most 51 characters. Long project names are shortened.")
 
 opts = Options(sheet_name=sheet, project_name=name, calendar_name=cal_name, dayfirst=dayfirst, holidays=holidays,
-               use_source_logic=use_src, hierarchy_mode=mode,
+               use_source_logic=use_src, fit_source_logic=fit_src, hierarchy_mode=mode, mapping=mapping,
                project_start=start if start != probe.stats["excel_start"] else None,
                work_week=work_week, hours_per_day=hours, policy=base_opts.policy)
 res = convert(data, up.name, opts)
@@ -242,6 +310,49 @@ chips = "".join(f'<span class="sc-chip" title="{esc(t)}">{esc(c)}</span>' for c,
     (ww_chip, f"Work week: {ww['reason']}")])
 st.markdown(f'<div class="sc-proj"><h2>{esc(res.project.name)}</h2><div>{chips}</div></div>',
             unsafe_allow_html=True)
+
+# --------------------------------------------------------------------------- #
+# File check
+# --------------------------------------------------------------------------- #
+mp = res.info.get("mapping", {})
+src_warn = [i for i in res.issues if i[0] == "warning"]
+fitted = stt.get("src_links_fitted", 0)
+assumed = res.info.get("assumed_start")
+with st.expander(f"File check{' · ' + str(len(src_warn)) + ' to review' if src_warn else ''}",
+                 icon=":material/fact_check:", expanded=bool(assumed or src_warn)):
+    if assumed:
+        st.warning(f"No calendar dates in the file. Period 1 was set to {stt['output_start']:%a %d %b %Y}. "
+                   f"Set the real start under Project settings.", icon=":material/event:")
+    fc1, fc2 = st.columns([1.3, 1], gap="large")
+    unit_word = {"w": "week", "mo": "month", "d": "day"}.get(res.info.get("period_unit") or "", "")
+    found = []
+    for k, lbl in FIELDS:
+        if k in mp.get("cols", {}):
+            hdr = mp.get("headers", {}).get(k, "")
+            extra = f" ({unit_word} numbers)" if (k in ("start_wk", "finish_wk") and unit_word
+                                                   and unit_word not in hdr.lower()) else ""
+            found.append({"Field": lbl.rstrip(" *"), "Column": col_letter(mp["cols"][k]), "Header in file": hdr + extra})
+    fc1.dataframe(pd.DataFrame(found), hide_index=True, width="stretch")
+    n_read = len([r for r in res.rows if r.start or r.finish])
+    lines = [f"**{n_read}** rows read from **{mp.get('sheet', res.sheet_name)}**, header row {mp.get('header_row', '')}"
+             + (" (mapped by hand)" if mp.get("manual") else ""),
+             f"**{len(res.ignored)}** notes / legend rows ignored",
+             f"Work week **{ww['label']}**: {ww['reason']}"]
+    if "preds" in mp.get("cols", {}):
+        lines.append(f"Workbook logic: **{fitted}** links fitted to the dates, "
+                     f"**{stt.get('src_logic_problems', 0)}** removed or not found")
+    fc2.markdown("\n".join(f"- {x}" for x in lines))
+    if src_warn:
+        fc2.dataframe(pd.DataFrame([{"ID": str(i[1]), "Task": i[2], "Issue": i[3]} for i in src_warn]),
+                      hide_index=True, width="stretch", height=min(38 * len(src_warn) + 38, 260))
+    fb1, fb2, _ = st.columns([1.2, 1, 2])
+    fb1.download_button("Standardised workbook", exporters.to_standard_xlsx(res),
+                        f"{re.sub(r'[^A-Za-z0-9]+', '_', res.project.name).strip('_')[:60]}_Standard.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        icon=":material/table_view:", width="stretch",
+                        help="Your schedule in the standard layout, with dates resolved. Edit it and upload it again.")
+    if fb2.toggle("Map columns by hand", value=bool(mapping), key="mp-toggle"):
+        column_mapper(mp)
 
 CHECK = ('<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" '
          'stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>')

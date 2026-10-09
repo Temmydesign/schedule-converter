@@ -23,6 +23,16 @@ durations and wording such as "6-day week" or "24/7"; firm default Mon–Fri. Ov
 day, in the sidebar. On 6- and 7-day calendars durations and lags are written in days so MS Project
 imports them exactly.
 
+Any layout:
+- Dates, week/month/day numbers ("Start (Month)", "Start Wk", "Duration (Months)"), or a drawn Gantt.
+- Headers with units in brackets or line breaks; codes explained in a legend (e.g. "A - Substructure").
+- No dates at all: period 1 is assumed to start next Monday (shown as a warning) until you set the real start.
+- Workbook predecessors are kept; self-links and loops are removed; links that contradict the dates are
+  fitted (type/lag) so nothing moves. Every change is listed in **File check**.
+- Layout still not recognised: the **column mapper** appears instead of an error.
+- **Standardised workbook** (File check) gives the schedule back in the standard layout to edit and re-upload;
+  a blank template is on the start page.
+
 Extras in the app: a sidebar for policy settings (max lead, close open ends, holidays, date format), a
 re-baseline option (move the whole schedule to a new start/NTP date), predecessors you can edit and
 re-verify, a Gantt preview with the critical path, and an optional AI planning review.
