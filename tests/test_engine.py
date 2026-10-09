@@ -219,3 +219,16 @@ def test_calendar_name_fits_ms_project_limit():
     assert short.calendar_name == "Test Project CALENDAR"
     own = convert(book(rows), "n.xlsx", Options(project_name=long_name, calendar_name="TRP L2 CALENDAR"))
     assert own.calendar_name == "TRP L2 CALENDAR"
+
+
+def test_mspdi_has_remaining_duration_for_every_task():
+    """MS Project imports Duration = Actual + Remaining; a missing RemainingDuration gives 0-day tasks."""
+    rows = [["Activity", "Start", "Finish"], ["A", wd(0), wd(9)], ["B", wd(10), wd(24)]]
+    res = convert(book(rows), "d.xlsx", Options())
+    ns = "{http://schemas.microsoft.com/project}"
+    tasks = ET.fromstring(exporters.to_mspdi(res)).find(f"{ns}Tasks")
+    for t in tasks:
+        assert t.find(f"{ns}RemainingDuration") is not None, t.find(f"{ns}Name").text
+        assert t.find(f"{ns}RemainingDuration").text == t.find(f"{ns}Duration").text
+    b = [t for t in tasks if t.find(f"{ns}Name").text == "B"][0]
+    assert b.find(f"{ns}Duration").text == "PT120H0M0S"
