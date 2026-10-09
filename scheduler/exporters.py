@@ -144,8 +144,9 @@ def to_mspdi(res, author: str = "Naphtali PM Group") -> bytes:
     cals = sub(P, "Calendars")
     c = sub(cals, "Calendar")
     sub(c, "UID", 1)
-    sub(c, "Name", clean_text(res.calendar_name)[:250])
+    sub(c, "Name", clean_text(res.calendar_name)[:51])
     sub(c, "IsBaseCalendar", 1)
+    sub(c, "IsBaselineCalendar", 0)
     sub(c, "BaseCalendarUID", -1)
     wds = sub(c, "WeekDays")
     names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
