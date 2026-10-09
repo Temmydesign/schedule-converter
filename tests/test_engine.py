@@ -232,3 +232,14 @@ def test_mspdi_has_remaining_duration_for_every_task():
         assert t.find(f"{ns}RemainingDuration").text == t.find(f"{ns}Duration").text
     b = [t for t in tasks if t.find(f"{ns}Name").text == "B"][0]
     assert b.find(f"{ns}Duration").text == "PT120H0M0S"
+
+
+def test_xer_header_and_activity_types():
+    if not exporters.xer_available():
+        pytest.skip("Java / MPXJ not installed")
+    rows = [["Activity", "Type", "Start", "Finish"], ["NTP", "Milestone", wd(0), wd(0)],
+            ["Work", "Task", wd(0), wd(9)], ["Done", "Milestone", wd(9), wd(9)]]
+    res = convert(book(rows), "x.xlsx", Options())
+    text = exporters.to_xer(res).decode("cp1252")
+    assert text.startswith("ERMHDR\t19.12\t")
+    assert "TT_Mile" in text and "TT_FinMile" in text and "TT_Rsrc" not in text
