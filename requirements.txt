@@ -1,4 +1,11 @@
-streamlit
-pandas
-openpyxl
-numpy
+streamlit==1.65.0
+pandas==3.0.5
+numpy==2.5.3
+openpyxl==3.1.5
+xlrd==2.0.2
+plotly==7.1.0
+# Primavera P6 .XER export (needs Java - see packages.txt). Remove these 2 lines and packages.txt to disable.
+mpxj==16.10.0
+JPype1==1.7.1
+# Optional AI review (only used if ANTHROPIC_API_KEY is set in Streamlit secrets)
+anthropic

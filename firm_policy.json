@@ -1,0 +1,28 @@
+{
+  "_comment": "Naphtali PM Group scheduling policy. Edit these defaults to change how every upload is converted. Users can still override most of them in the app sidebar.",
+
+  "project_title_as_level_1": true,
+
+  "completion_milestone_suffix": "completed",
+  "completion_milestone_for_project_title": false,
+  "completion_milestone_label_aliases": {
+    "MS": "Programme Milestones",
+    "MILESTONES": "Programme Milestones",
+    "KEY MILESTONES": "Programme Milestones"
+  },
+  "group_summary_prefix_from_column_header": true,
+
+  "calendar_name_suffix": " CALENDAR",
+  "working_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+  "hours_per_day": 8,
+  "day_start": "08:00",
+  "day_finish": "17:00",
+  "lunch_break": ["12:00", "13:00"],
+
+  "max_lead_weeks": 2,
+  "close_open_ends": false,
+  "kickoff_link_type": "SS",
+
+  "csv_date_format": "%Y-%m-%d",
+  "csv_columns": ["ID", "Task Name", "Duration", "Start Date", "Finish Date", "Predecessors", "Outline Level", "WBS"]
+}
