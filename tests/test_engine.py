@@ -243,3 +243,49 @@ def test_xer_header_and_activity_types():
     text = exporters.to_xer(res).decode("cp1252")
     assert text.startswith("ERMHDR\t19.12\t")
     assert "TT_Mile" in text and "TT_FinMile" in text and "TT_Rsrc" not in text
+
+
+def _wd(n, days):
+    return np.busday_offset(np.datetime64(D0), n, roll="forward",
+                            weekmask=[1] * days + [0] * (7 - days)).astype(dt.date)
+
+
+@pytest.mark.parametrize("days", [6, 7])
+def test_work_week_detected_from_weekend_dates(days):
+    d = lambda n: _wd(n, days)  # noqa: E731
+    rows = [["Activity", "Start", "Finish"],
+            ["Mobilise", d(0), d(5)], ["Excavate", d(6), d(17)], ["Pour", d(18), d(29)],
+            ["Cure", d(30), d(36)], ["Handover", d(37), d(37)]]
+    res = convert(book(rows), "s.xlsx", Options())
+    check(res)
+    ww = res.info["work_week"]
+    assert ww["days"] == days and ww["source"] == "dates"
+    xml = exporters.to_mspdi(res).decode()
+    assert f"<MinutesPerWeek>{480 * days}</MinutesPerWeek>" in xml
+    if days == 6:
+        assert "<DayType>7</DayType>\n          <DayWorking>1</DayWorking>" in xml   # Saturday working
+    dur = exporters.duration_text(next(n for n in res.nodes if n.name == "Excavate"), days)
+    assert dur == "12 days"                       # days, never 'wks', on non 5-day calendars
+
+
+def test_work_week_detected_from_text_and_manual_override():
+    rows = [["Activity", "Start Wk", "Dur (wks)"], ["Site prep (6-day week, Mon-Sat)", 1, 2], ["Build", 3, 4]]
+    res = convert(book(rows), "t.xlsx", Options(project_start=D0))
+    assert res.info["work_week"]["days"] == 6 and res.info["work_week"]["source"] == "text"
+    build = next(n for n in res.nodes if n.name == "Build")
+    assert build.dur == 24 and res.stats["date_mismatches"] == 0       # 4 weeks x 6 days
+    forced = convert(book(rows), "t.xlsx", Options(project_start=D0, work_week=5))
+    assert forced.info["work_week"]["days"] == 5 and forced.info["work_week"]["source"] == "manual"
+
+
+def test_default_stays_mon_fri():
+    rows = [["Activity", "Start", "Finish"], ["A", wd(0), wd(9)], ["B", wd(10), wd(19)]]
+    res = convert(book(rows), "m.xlsx", Options())
+    assert res.info["work_week"]["days"] == 5
+
+
+def test_long_shift_hours():
+    rows = [["Activity", "Start", "Finish"], ["A", wd(0), wd(9)]]
+    res = convert(book(rows), "h.xlsx", Options(hours_per_day=12))
+    xml = exporters.to_mspdi(res).decode()
+    assert "<MinutesPerDay>720</MinutesPerDay>" in xml and res.stats["date_mismatches"] == 0
