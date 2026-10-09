@@ -11,6 +11,10 @@ from . import builder, calendar_detect, cpm, logic, reader
 from .model import Link, WorkCalendar, load_policy
 
 
+class NoScheduleFound(ValueError):
+    """Raised when no sheet/header could be recognised; the app then offers manual column mapping."""
+
+
 @dataclass
 class Options:
     sheet_name: Optional[str] = None
@@ -22,7 +26,9 @@ class Options:
     hierarchy_mode: Optional[str] = None         # wbs | indent | summary-rows | group | flat
     policy: dict = field(default_factory=dict)   # overrides on firm_policy.json
     calendar_name: Optional[str] = None          # explicit calendar name (max 51 chars in MS Project)
+    fit_source_logic: bool = True                # adjust workbook links so the Excel dates are kept
     work_week: Optional[int] = None              # 5, 6 or 7 working days; None = auto-detect
+    mapping: Optional[dict] = None               # manual layout: {sheet, header_row (1-based), cols{key: idx}, period_unit}
     hours_per_day: Optional[float] = None        # None = firm policy
 
 
@@ -54,17 +60,22 @@ def convert(data: bytes, filename: str, opts: Optional[Options] = None) -> Resul
     policy.update(opts.policy or {})
 
     sheets = reader.read_sheets(data, filename)
-    ranked = reader.rank_sheets(sheets)
-    if not ranked:
-        raise ValueError(
-            "No schedule found. The workbook needs a sheet with an activity/task column and "
-            "either Start/Finish dates, Start week + Duration, or a Gantt timeline.")
-    choice = ranked[0]
-    if opts.sheet_name:
-        match = [x for x in ranked if x[0].name == opts.sheet_name]
-        if match:
-            choice = match[0]
-    sheet, header, _ = choice
+    if opts.mapping:
+        sheet, header = reader.header_from_mapping(sheets, opts.mapping)
+        ranked = [(sheet, header, 0)]
+    else:
+        ranked = reader.rank_sheets(sheets)
+        if not ranked:
+            raise NoScheduleFound(
+                "The schedule layout wasn't recognised automatically. Map the columns below: the app needs an "
+                "activity column and either start/finish dates, start period numbers with durations, or a "
+                "Gantt timeline.")
+        choice = ranked[0]
+        if opts.sheet_name:
+            match = [x for x in ranked if x[0].name == opts.sheet_name]
+            if match:
+                choice = match[0]
+        sheet, header, _ = choice
 
     # ---------------- work week ---------------- #
     default_days = policy.get("working_days") or calendar_detect.week_days(5)
@@ -110,14 +121,22 @@ def convert(data: bytes, filename: str, opts: Optional[Options] = None) -> Resul
         group_header = str(sheet.cell(header.row, header.cols["group"]) or "").strip()
 
     project, nodes, info = builder.build_outline(rows, project_name, cal, policy,
-                                                 group_header or "Group", opts.hierarchy_mode)
+                                                 group_header or "Group", opts.hierarchy_mode,
+                                                 header.group_legend)
+    info["assumed_start"] = header.assumed_start
+    info["mapping"] = {"sheet": sheet.name, "header_row": header.row + 1, "cols": dict(header.cols),
+                       "period_unit": header.period_unit,
+                       "headers": {k: str(sheet.cell(header.row, c) or "").replace("\n", " ").strip()
+                                   for k, c in header.cols.items()},
+                       "manual": bool(opts.mapping)}
+    info["period_unit"] = header.period_unit if "start_wk" in header.cols else None
 
     # ---------------- logic ---------------- #
     sched = [n for n in nodes if n.kind in ("task", "milestone")]
     src_linked, src_problems = set(), []
     if opts.use_source_logic and "preds" in header.cols:
         src_linked, src_problems = logic.apply_source_logic(nodes, info.get("duration_unit", "d"),
-                                                            cal.days_per_week)
+                                                            cal.days_per_week, opts.fit_source_logic)
     to_infer = set(n for n in sched if n not in src_linked)
     anchor = logic.infer_logic(sched, policy, only=to_infer, dpw=cal.days_per_week)
     logic.link_completion_milestones(project)
@@ -229,6 +248,8 @@ def quality_checks(nodes, cal, out_cal, rows, header, anchor, floats, src_proble
         if r.duration is None or not (r.start and r.finish) or n.kind != "task":
             continue
         wd = cal.working_days_between(r.start, r.finish)
+        if (r.dur_unit or "d") == "mo":
+            continue                              # calendar months vary in working days
         exp = r.duration * (cal.days_per_week if (r.dur_unit or "d") == "w" else 1)
         if abs(wd - exp) > 0.01:
             issues.append(("warning", n.id, n.name,
@@ -286,10 +307,11 @@ def quality_checks(nodes, cal, out_cal, rows, header, anchor, floats, src_proble
         "duration_days": proj_ef,
         "critical": len(crit),
         "anchor": anchor.name if anchor else "",
-        "src_logic_problems": len(src_problems),
+        "src_logic_problems": sum(1 for p in src_problems if p[0] == "warning"),
+        "src_links_fitted": sum(1 for p in src_problems if p[0] == "info"),
     }
-    for pid, name, msg in src_problems:
-        issues.append(("warning", pid, name, msg))
+    for sev, pid, name, msg in src_problems:
+        issues.append((sev, pid, name, msg))
     if not stats["finish_matches"]:
         issues.insert(0, ("error", "", "Project", f"Calculated finish {calc_finish:%d-%b-%y} differs from "
                                                   f"Excel finish {_d(excel_finish)}"))
@@ -332,3 +354,25 @@ def apply_edited_predecessors(res: Result, edits: dict):
     res.issues, res.stats = quality_checks(res.nodes, res.cal, res.out_cal, res.rows, None, res.anchor,
                                            res.floats, [], res.policy)
     return res
+
+
+# --------------------------------------------------------------------------- #
+# Layout inspection (for manual column mapping in the app)
+# --------------------------------------------------------------------------- #
+def inspect_layout(data: bytes, filename: str) -> list:
+    """[{sheet, header_row (1-based guess), columns: [(idx, label)], guess: {key: idx}}] for every sheet."""
+    out = []
+    for sh in reader.read_sheets(data, filename):
+        hr = reader.guess_header_row(sh)
+        cols, guess = [], {}
+        if hr is not None:
+            for c, v in enumerate(sh.values[hr]):
+                label = str(v).replace("\n", " ").strip() if v not in (None, "") else ""
+                letter = reader.col_letter(c)
+                cols.append((c, f"{letter}: {label}" if label else letter))
+                k = reader.classify_header(v) if isinstance(v, str) else None
+                if k and k not in guess:
+                    guess[k] = c
+        out.append({"sheet": sh.name, "header_row": (hr + 1) if hr is not None else 1, "columns": cols,
+                    "guess": guess, "rows": sh.nrows})
+    return out

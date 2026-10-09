@@ -177,8 +177,14 @@ def _lag_days(text: str, default_unit: str, dpw: int = 5) -> int:
     return int(round(v))
 
 
-def apply_source_logic(nodes: list, default_unit: str = "d", dpw: int = 5):
-    """Parse predecessor text found in the spreadsheet. Returns (linked set, problems)."""
+def apply_source_logic(nodes: list, default_unit: str = "d", dpw: int = 5, fit_to_dates: bool = True):
+    """Use predecessors written in the spreadsheet.
+
+    * self-references and links that would create a loop are removed (reported as warnings);
+    * with fit_to_dates (default) each kept link is adjusted (type/lag) only where needed so that
+      MS Project lands every activity on its Excel dates; every adjustment is reported.
+    Returns (linked set, problems) where problems = [(severity, id, name, message)].
+    """
     keys = {}
     srcs = [n for n in nodes if n.src is not None]
     # priority: activity ID column, then WBS code, then Excel row number
@@ -194,29 +200,107 @@ def apply_source_logic(nodes: list, default_unit: str = "d", dpw: int = 5):
         if n.src is None or not n.src.preds or n.is_summary:
             continue
         links = []
-        for tok in re.split(r"[,;\n]+", n.src.preds):
+        for tok in re.split(r"[,;\n/]+|\s{2,}", str(n.src.preds)):
             tok = tok.strip()
-            if not tok:
+            if not tok or tok in ("-", "–", "—", "nil", "none", "n/a", "NA", "N/A"):
                 continue
             m = _TOKEN.match(tok)
             ref = m.group("ref").strip().upper() if m else tok.upper()
             P = keys.get(ref)
             if P is None:
-                problems.append((n.id, n.name, f"predecessor '{tok}' not found"))
+                problems.append(("warning", n.id, n.name, f"Predecessor '{tok}' not found in the workbook; ignored"))
+                continue
+            if P is n:
+                problems.append(("warning", n.id, n.name,
+                                 f"Lists itself ('{tok}') as a predecessor - removed. Check the numbering in the workbook."))
                 continue
             if P.is_summary:
                 cm = next((c for c in P.children if c.kind == "completion"), None)
                 if cm is None:
-                    problems.append((n.id, n.name, f"predecessor '{tok}' is a summary - skipped"))
+                    problems.append(("warning", n.id, n.name, f"Predecessor '{tok}' is a summary - ignored"))
                     continue
                 P = cm
             typ = (m.group("type") or "FS").upper() if m else "FS"
             lag = _lag_days(m.group("lag"), default_unit, dpw) if m else 0
+            if P.t_start is not None and n.t_start is not None and P.t_start > n.t_start:
+                problems.append(("warning", n.id, n.name,
+                                 f"Predecessor '{tok}' ({P.name[:40]}) starts after this activity in the Excel - removed"))
+                continue
             links.append(Link(P, typ, lag, "from spreadsheet"))
         if links:
             n.preds = links
             linked.add(n)
+
+    _break_cycles(nodes, problems)
+    linked = {n for n in linked if n.preds}
+    if fit_to_dates:
+        for n in sorted(linked, key=lambda x: x.order):
+            _fit_links(n, problems)
     return linked, problems
+
+
+def _contribution(link: Link, T: Node) -> int:
+    P = link.pred
+    if link.type == "FS":
+        return P.t_finish + link.lag
+    if link.type == "SS":
+        return P.t_start + link.lag
+    if link.type == "FF":
+        return P.t_finish + link.lag - T.dur
+    return P.t_start + link.lag - T.dur
+
+
+def _fit_links(T: Node, problems: list):
+    """Adjust spreadsheet links so the forward pass reproduces T's Excel start exactly."""
+    target = T.t_start
+    for l in T.preds:
+        if l.pred.t_start is None:
+            continue
+        if _contribution(l, T) > target:                       # would push T later than the Excel
+            before = f"{l.type}{_fmt_lag(l.lag, 'd')}"
+            gap = target - l.pred.t_finish
+            if l.type in ("FS", "FF") and gap >= 0:
+                l.type, l.lag = "FS", gap
+            elif target >= l.pred.t_start:
+                l.type, l.lag = "SS", target - l.pred.t_start
+            else:
+                l.type, l.lag = "FS", gap
+            problems.append(("info", T.id, T.name,
+                             f"Link from {l.pred.id} changed {before} -> {l.type}{_fmt_lag(l.lag, 'd')} so the "
+                             f"activity keeps its Excel start (the workbook dates overlap)"))
+            l.reason = "spreadsheet link fitted to Excel dates"
+    if T.preds and max(_contribution(l, T) for l in T.preds) < target:
+        l = max(T.preds, key=lambda x: (_contribution(x, T), x.pred.order))
+        add = target - _contribution(l, T)
+        l.lag += add
+        problems.append(("info", T.id, T.name,
+                         f"Link from {l.pred.id} given +{add} day lag: the Excel starts this activity later than "
+                         f"its predecessors allow"))
+        l.reason = "spreadsheet link fitted to Excel dates"
+
+
+def _break_cycles(nodes: list, problems: list):
+    """Remove spreadsheet links that close a loop (keeps the schedule calculable)."""
+    from .cpm import CycleError, topo_order
+    items = [n for n in nodes if n.schedulable]
+    for _ in range(len(items)):
+        try:
+            topo_order(items)
+            return
+        except CycleError:
+            pass
+        # drop the link whose predecessor starts latest relative to its successor
+        worst = None
+        for n in items:
+            for l in n.preds:
+                key = ((l.pred.t_start or 0) - (n.t_start or 0), l.pred.order - n.order)
+                if worst is None or key > worst[0]:
+                    worst = (key, n, l)
+        if worst is None:
+            return
+        _, n, l = worst
+        n.preds.remove(l)
+        problems.append(("warning", n.id, n.name, f"Link from {l.pred.id} removed: it created a loop"))
 
 
 # --------------------------------------------------------------------------- #

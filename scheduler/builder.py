@@ -101,7 +101,7 @@ def _levels(rows: list, mode: str) -> list:
 
 
 def build_outline(rows: list, project_name: str, cal: WorkCalendar, policy: dict,
-                  group_header: str = "System", mode: Optional[str] = None):
+                  group_header: str = "System", mode: Optional[str] = None, group_legend: Optional[dict] = None):
     """Return (project_node, all_nodes_in_order, info dict)."""
     info = {"dropped": [], "mode": None}
     unit = infer_duration_unit(rows, cal)
@@ -126,7 +126,14 @@ def build_outline(rows: list, project_name: str, cal: WorkCalendar, policy: dict
             groups[g].append(r)
         prefix = (group_header.strip().title() + ": ") if policy.get("group_summary_prefix_from_column_header", True) and group_header else ""
         for g in order:
-            gnode = Node(name=f"{prefix}{g}", kind="summary", level=2, parent=project, label=g, dur_unit=unit)
+            desc = (group_legend or {}).get(g)
+            if desc:
+                word = group_header.strip().title() if group_header else ""
+                gname = f"{word} {g} - {desc}".strip()
+                glabel = f"{word} {g}".strip()
+            else:
+                gname, glabel = f"{prefix}{g}", g
+            gnode = Node(name=gname, kind="summary", level=2, parent=project, label=glabel, dur_unit=unit)
             project.children.append(gnode)
             for r in groups[g]:
                 n = _row_node(r, 3, gnode, unit)
@@ -164,6 +171,11 @@ def build_outline(rows: list, project_name: str, cal: WorkCalendar, policy: dict
         if summary.kind == "project" and not policy.get("completion_milestone_for_project_title", False):
             return
         label = summary.label or summary.name
+        if label == summary.name:                 # e.g. "System: PRG" -> "PRG", "Phase A - Substructure" -> "Phase A"
+            m = re.match(r"^[A-Za-z][A-Za-z ]{1,20}:\s*(\S.*)$", label) or \
+                re.match(r"^([A-Za-z]+ [A-Za-z0-9]{1,4}) - \S.*$", label)
+            if m:
+                label = m.group(1).strip()
         label = aliases.get(label.strip().upper(), label)
         cm = Node(name=f"{label} {suffix}", kind="completion", level=summary.level + 1,
                   parent=summary, label=label, dur_unit=summary.dur_unit)

@@ -380,3 +380,137 @@ def to_qa_xlsx(res) -> bytes:
                 width = max(len(str(c.value or "")) for c in col[:200])
                 ws.column_dimensions[col[0].column_letter].width = min(max(10, width + 2), 80)
     return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# Standardised workbook (the "compatible version" users can edit and re-upload)
+# --------------------------------------------------------------------------- #
+STANDARD_COLUMNS = ["ID", "WBS", "Activity", "Type", "Start", "Finish", "Duration (days)", "Predecessors"]
+
+_README = [
+    ("What this file is", "A schedule in the Naphtali PM Group standard layout. Upload it to the Schedule Converter as is."),
+    ("ID", "Unique number for each row. Predecessors refer to these IDs."),
+    ("WBS", "Outline code: 1, 1.1, 1.1.1 ... A row with rows beneath it becomes a summary task."),
+    ("Activity", "Activity name (required)."),
+    ("Type", "Summary, Task or Milestone. Milestones have 0 duration."),
+    ("Start / Finish", "Calendar dates (dd/mm/yyyy). Required for tasks and milestones; optional for summaries."),
+    ("Duration (days)", "Working days. Optional: the dates are what is scheduled."),
+    ("Predecessors", "Optional. IDs with type and lag, e.g. 3, 5SS, 7FS+2d, 9FF-1w. Leave blank to let the app "
+                     "write the logic from the dates."),
+    ("Policy", "Do not add the project title row or '... completed' milestones: the app adds them."),
+]
+
+
+def _standard_rows(res):
+    """Rows for the standard layout (project title and policy milestones are left out)."""
+    keep = [n for n in res.nodes if n.kind not in ("project", "completion")]
+    new_id = {n: i for i, n in enumerate(keep, start=1)}
+    rows = []
+    for n in keep:
+        s, f = cpm.display_dates(n, res.out_cal)
+        preds = []
+        for l in n.preds:
+            p = l.pred
+            if p.kind == "completion":
+                p = p.parent                      # link to the summary itself
+            if p in new_id:
+                lag = "" if l.lag == 0 else f"{'+' if l.lag > 0 else '-'}{abs(l.lag)}d"
+                preds.append(f"{new_id[p]}{'' if (l.type == 'FS' and not lag) else l.type}{lag}")
+        rows.append({
+            "ID": new_id[n],
+            "WBS": n.wbs.split(".", 1)[1] if "." in n.wbs else n.wbs,
+            "Activity": clean_text(n.name),
+            "Type": "Summary" if n.is_summary else ("Milestone" if n.is_milestone else "Task"),
+            "Start": s, "Finish": f,
+            "Duration (days)": None if n.is_summary else n.dur,
+            "Predecessors": ", ".join(preds),
+        })
+    return rows
+
+
+def _write_standard(rows, settings, title):
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Schedule"
+    ws["A1"] = title
+    ws["A1"].font = Font(bold=True, size=13)
+    ws.append([])
+    ws.append(STANDARD_COLUMNS)
+    head_fill = PatternFill("solid", fgColor="0E2A47")
+    for c in ws[3]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = head_fill
+        c.alignment = Alignment(vertical="center")
+    for r in rows:
+        ws.append([r[k] for k in STANDARD_COLUMNS])
+        row = ws.max_row
+        if r["Type"] == "Summary":
+            for c in ws[row]:
+                c.font = Font(bold=True)
+        indent = r["WBS"].count(".") if r["WBS"] else 0
+        ws.cell(row, 3).alignment = Alignment(indent=indent)
+        for col in (5, 6):
+            ws.cell(row, col).number_format = "dd/mm/yyyy"
+    dv = DataValidation(type="list", formula1='"Summary,Task,Milestone"', allow_blank=True)
+    ws.add_data_validation(dv)
+    dv.add(f"D4:D{max(ws.max_row, 4) + 200}")
+    widths = {"A": 6, "B": 9, "C": 70, "D": 11, "E": 12, "F": 12, "G": 15, "H": 22}
+    for k, v in widths.items():
+        ws.column_dimensions[k].width = v
+    ws.freeze_panes = "A4"
+
+    rd = wb.create_sheet("Read me")
+    rd.append(["Field", "How to fill it"])
+    for c in rd[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = head_fill
+    for k, v in _README:
+        rd.append([k, v])
+    rd.append([])
+    for k, v in settings:
+        rd.append([k, v])
+    rd.column_dimensions["A"].width = 22
+    rd.column_dimensions["B"].width = 110
+    for row in rd.iter_rows(min_row=2):
+        row[1].alignment = Alignment(wrap_text=True, vertical="top")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def to_standard_xlsx(res) -> bytes:
+    ww = res.info.get("work_week", {})
+    settings = [("Project", res.project.name), ("Source file sheet", res.sheet_name),
+                ("Work week", f"{ww.get('label', '')}, {ww.get('hours_per_day', 8):g} h/day"),
+                ("Start date", f"{res.stats['output_start']:%d/%m/%Y}")]
+    return _write_standard(_standard_rows(res), settings, res.project.name)
+
+
+def blank_template_xlsx() -> bytes:
+    import datetime as _dt
+    d = _dt.date.today()
+    d = d + _dt.timedelta(days=(7 - d.weekday()) % 7 or 7)
+    bd = lambda n: np_busday(d, n)  # noqa: E731
+    rows = [
+        {"ID": 1, "WBS": "1", "Activity": "PHASE 1 - MOBILISATION", "Type": "Summary", "Start": None, "Finish": None,
+         "Duration (days)": None, "Predecessors": ""},
+        {"ID": 2, "WBS": "1.1", "Activity": "Contract award / Notice to Proceed", "Type": "Milestone",
+         "Start": d, "Finish": d, "Duration (days)": 0, "Predecessors": ""},
+        {"ID": 3, "WBS": "1.2", "Activity": "Mobilise team and site", "Type": "Task", "Start": d, "Finish": bd(9),
+         "Duration (days)": 10, "Predecessors": "2"},
+        {"ID": 4, "WBS": "2", "Activity": "PHASE 2 - ENGINEERING", "Type": "Summary", "Start": None, "Finish": None,
+         "Duration (days)": None, "Predecessors": ""},
+        {"ID": 5, "WBS": "2.1", "Activity": "Design basis", "Type": "Task", "Start": bd(10), "Finish": bd(24),
+         "Duration (days)": 15, "Predecessors": "3"},
+    ]
+    return _write_standard(rows, [("Example rows", "Replace rows 4-8 with your schedule.")],
+                           "Project name - Level 2 Schedule")
+
+
+def np_busday(d, n):
+    import numpy as np
+    return np.busday_offset(np.datetime64(d), n, roll="forward").astype(type(d))

@@ -207,21 +207,43 @@ COLUMN_PATTERNS = [
     ("type", r"^(type|activity type|task type|act\.? type|category|item type)$"),
     ("wbs", r"^(wbs|wbs (code|id|no\.?|number|ref)|ref\.?|ref\.? no\.?|item( no\.?)?|s/?n|s\.n\.?|no\.?|#|outline( number| no\.?)?|level)$"),
     ("group", r"^(system|sub-?system|phase|area|discipline|group|stage|work ?stream|package|work package|unit|section|department|location|facility|asset|module|zone|contract|lot)$"),
-    ("start", r"^((planned|plan|early|baseline|bl|scheduled|target|forecast|actual)\s+)?(start|begin)(\s*date)?$|^start date\b|^from$"),
-    ("finish", r"^((planned|plan|early|baseline|bl|scheduled|target|forecast|actual)\s+)?(finish|end|completion|complete|due)(\s*date)?$|^finish date\b|^to$"),
+    ("start", r"^((planned|plan|early|baseline|bl|scheduled|target|forecast|actual)\s+)?(start|starts|begin|begins|commence|commencement)(\s*(date|on))?$|^start date\b|^from$|^date from$"),
+    ("finish", r"^((planned|plan|early|baseline|bl|scheduled|target|forecast|actual)\s+)?(finish|finishes|end|ends|completion|complete|completed|due)(\s*(date|on|by))?$|^finish date\b|^to$|^date to$"),
     ("duration", r"^(dur\.?|duration|original duration|orig\.? dur\.?|od|planned duration|days|weeks|wks)(\s*\((wks?|weeks?|days?|d|w)\))?$|^dur(ation)?\s*[\(\[]"),
     ("name", r"^(activity|activities|task|tasks|activity name|task name|name|description|activity description|task description|deliverable|deliverables|scope|work item|item description|title|activity title|milestone|milestones|work description)$"),
 ]
 
 
+def header_unit(text) -> Optional[str]:
+    """Unit written in a header, e.g. 'Duration (Months)' -> 'mo', 'Start Wk' -> 'w'."""
+    s = _norm(text)
+    if re.search(r"\b(months?|mths?|mos?)\b", s):
+        return "mo"
+    if re.search(r"\b(weeks?|wks?|w)\b", s):
+        return "w"
+    if re.search(r"\b(days?|d|wd|working days)\b", s):
+        return "d"
+    return None
+
+
+_PERIOD_HDR = re.compile(r"^(start|begin|finish|end|completion)\s*(wk|week|month|mth|mon|day|period)\s*(no\.?|#|number)?$"
+                         r"|^(wk|week|month|mth|day|period)\s*(start|begin|finish|end)$")
+
+
 def classify_header(text) -> Optional[str]:
     s = _norm(text)
-    if not s or len(s) > 60:
+    if not s or len(s) > 80:
         return None
     s = s.rstrip(":")
-    for key, pat in COLUMN_PATTERNS:
-        if re.search(pat, s):
-            return key
+    core = re.sub(r"\s+", " ", re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", s)).strip().rstrip(":")
+    if core and _PERIOD_HDR.match(core):
+        return "start_wk" if re.search(r"start|begin", core) else "finish_wk"
+    for cand in (core, s):
+        if not cand:
+            continue
+        for key, pat in COLUMN_PATTERNS:
+            if re.search(pat, cand):
+                return key
     return None
 
 
@@ -233,6 +255,9 @@ class HeaderInfo:
     timeline: dict = field(default_factory=dict)   # col -> period start date
     timeline_step: int = 7
     duration_header: str = ""
+    period_unit: str = "w"                        # unit of Start/Finish period numbers (w, d, mo)
+    group_legend: dict = field(default_factory=dict)
+    assumed_start: Optional[dt.date] = None
 
 
 def _find_timeline(sheet: Sheet, header_row: int, used_cols: set):
@@ -286,6 +311,7 @@ def detect_header(sheet: Sheet) -> Optional[HeaderInfo]:
                 cols[key] = c
         if "name" not in cols:
             continue
+        _promote_period_columns(sheet, r, cols)
         has_dates = ("start" in cols and ("finish" in cols or "duration" in cols)) or \
                     ("finish" in cols and "duration" in cols)
         has_weeks = "start_wk" in cols and ("duration" in cols or "finish_wk" in cols)
@@ -306,9 +332,29 @@ def detect_header(sheet: Sheet) -> Optional[HeaderInfo]:
             info.score += 1
         if "duration" in cols:
             info.duration_header = str(sheet.cell(r, cols["duration"]))
+        for k in ("start_wk", "finish_wk"):
+            if k in cols:
+                u = header_unit(sheet.cell(r, cols[k]))
+                if u:
+                    info.period_unit = u
+                    break
         if best is None or info.score > best.score:
             best = info
     return best
+
+
+def _promote_period_columns(sheet: Sheet, r: int, cols: dict):
+    """A 'Start' / 'Finish' column holding small whole numbers is a period number (week/month/day 1, 2 ...)."""
+    for k, target in (("start", "start_wk"), ("finish", "finish_wk")):
+        if k not in cols or target in cols:
+            continue
+        vals = [sheet.cell(rr, cols[k]) for rr in range(r + 1, min(sheet.nrows, r + 40))]
+        vals = [v for v in vals if v not in (None, "")]
+        if not vals:
+            continue
+        nums = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v < 1000]
+        if len(nums) >= 0.7 * len(vals):
+            cols[target] = cols.pop(k)
 
 
 _SHEET_NAME_HINTS = re.compile(r"(schedul|programme|program|gantt|l[1-5]\b|level\s*[1-5]|plan|timeline|baseline|activities)", re.I)
@@ -359,11 +405,45 @@ def extract_rows(sheet: Sheet, h: HeaderInfo, project_start: Optional[dt.date] =
     week1 = week_map.get(1)
     if not week1 and h.timeline:
         week1 = min(h.timeline.values())
-    base_for_weeks = week1 or project_start
+    base_for_weeks = project_start or week1
+    punit = h.period_unit or "w"
+    if "start_wk" in cols and base_for_weeks is None:
+        # period numbers but no calendar dates anywhere: assume period 1 starts next Monday
+        today = dt.date.today()
+        base_for_weeks = today + dt.timedelta(days=(7 - today.weekday()) % 7 or 7)
+        h.assumed_start = base_for_weeks
+        word = {"w": "Week", "mo": "Month", "d": "Day"}.get(punit, "Period")
+        notes.append(f"The file has {word.lower()} numbers but no calendar dates. {word} 1 was assumed to start "
+                     f"{base_for_weeks:%a %d %b %Y}; set the real start in Project settings.")
+    mask = [1] * days_per_week + [0] * (7 - days_per_week)
+
+    def _roll(d, direction="forward"):
+        import numpy as np
+        return np.busday_offset(np.datetime64(d), 0, roll=direction, weekmask=mask).astype(dt.date)
+
+    def _wd_offset(d, n):
+        import numpy as np
+        return np.busday_offset(np.datetime64(d), int(n), roll="forward", weekmask=mask).astype(dt.date)
+
+    def period_start(n):
+        n = int(n)
+        if punit == "mo":
+            return _roll(_add_months(base_for_weeks, n - 1))
+        if punit == "d":
+            return _wd_offset(base_for_weeks, n - 1)
+        return base_for_weeks + dt.timedelta(weeks=n - 1)
+
+    def period_end(n):
+        n = int(n)
+        if punit == "mo":
+            return _roll(_add_months(base_for_weeks, n) - dt.timedelta(days=1), "backward")
+        if punit == "d":
+            return _wd_offset(base_for_weeks, n - 1)
+        return base_for_weeks + dt.timedelta(weeks=n - 1, days=days_per_week - 1)
 
     # duration unit from header
     dh = _norm(h.duration_header)
-    header_unit = "w" if re.search(r"(wk|week)", dh) else ("d" if re.search(r"(day|\(d\))", dh) else None)
+    header_unit = header_unit_fn(dh) if dh else None
 
     timeline_cols = sorted(h.timeline)
 
@@ -396,15 +476,19 @@ def extract_rows(sheet: Sheet, h: HeaderInfo, project_start: Optional[dt.date] =
         typ = get("type")
         typ = str(typ).strip() if typ not in (None, "") else None
 
-        # week-number schedules -------------------------------------------- #
+        # period-number schedules (week / month / day 1, 2, 3 ...) --------- #
         if start is None and swk is not None and base_for_weeks:
-            start = base_for_weeks + dt.timedelta(weeks=int(swk) - 1)
+            start = period_start(swk)
             if unit is None:
-                unit = "w"
+                unit = punit
+            if fwk is None and dur is not None and (unit == punit):
+                fwk = swk + max(dur, 1) - 1          # e.g. End = Start + Duration - 1 (missing formula values)
             if fwk is not None:
-                finish = base_for_weeks + dt.timedelta(weeks=int(fwk) - 1, days=days_per_week - 1)
+                finish = period_end(max(fwk, swk))
             elif dur is not None:
-                finish = start + dt.timedelta(weeks=max(int(dur), 1) - 1, days=days_per_week - 1)
+                finish = _add_working(start, max(dur, 1), unit or "d", days_per_week)
+            else:
+                finish = period_end(swk)
 
         gantt_ms = False
         if start is None and finish is None and timeline_cols:
@@ -460,6 +544,17 @@ def extract_rows(sheet: Sheet, h: HeaderInfo, project_start: Optional[dt.date] =
                 elif not x.is_summary:
                     x.group = cur
 
+    # legend for group codes (e.g. "A - Pre-Construction & Procurement") ------------ #
+    codes = {x.group for x in kept if x.group}
+    if codes and all(len(c) <= 4 for c in codes):
+        pat = re.compile(r"^\s*([A-Za-z0-9]{1,4})\s*[-–:=]\s*(.{3,90}?)\s*$")
+        for row_vals in sheet.values:
+            for v in row_vals:
+                if isinstance(v, str):
+                    m = pat.match(v)
+                    if m and m.group(1) in codes and m.group(1) not in h.group_legend:
+                        h.group_legend[m.group(1)] = m.group(2).strip()
+
     # fill missing start/finish from duration
     for x in kept:
         if x.is_summary:
@@ -474,11 +569,23 @@ def extract_rows(sheet: Sheet, h: HeaderInfo, project_start: Optional[dt.date] =
     return kept, ignored, notes
 
 
+def header_unit_fn(text):
+    return header_unit(text)
+
+
+def _add_months(d: dt.date, k: int) -> dt.date:
+    import calendar
+    y, m = divmod(d.month - 1 + k, 12)
+    y, m = d.year + y, m + 1
+    return dt.date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
+
+
 def _add_working(d: dt.date, dur: float, unit: str, days_per_week: int = 5) -> dt.date:
     import numpy as np
 
     mask = [1] * days_per_week + [0] * (7 - days_per_week)
-    days = int(round(dur * (days_per_week if unit == "w" else 1)))
+    per = {"w": days_per_week, "mo": round(days_per_week * 52 / 12)}.get(unit, 1)
+    days = int(round(dur * per))
     if days == 0:
         return d
     step = days - 1 if days > 0 else days + 1
@@ -527,3 +634,46 @@ def suggest_project_name(sheet: Sheet, header_row: int, filename: str) -> str:
     if lines:
         return re.sub(r"\s+", " ", lines[0])[:120]
     return re.sub(r"[_]+", " ", filename.rsplit(".", 1)[0]).strip()
+
+
+# --------------------------------------------------------------------------- #
+# Manual mapping helpers
+# --------------------------------------------------------------------------- #
+def col_letter(c: int) -> str:
+    s, c = "", c + 1
+    while c:
+        c, r = divmod(c - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def guess_header_row(sheet: Sheet) -> Optional[int]:
+    """Row (0-based) in the first 40 with the most short text cells followed by data."""
+    best, best_score = None, 0
+    for r in range(min(sheet.nrows, 40)):
+        texts = [v for v in sheet.values[r] if isinstance(v, str) and 0 < len(v.strip()) <= 60]
+        if len(texts) < 2:
+            continue
+        below = sum(1 for rr in range(r + 1, min(sheet.nrows, r + 30))
+                    if sum(1 for v in sheet.values[rr] if v not in (None, "")) >= 2)
+        score = len(texts) + below / 5 + sum(1 for v in texts if classify_header(v))
+        if score > best_score:
+            best, best_score = r, score
+    return best
+
+
+def header_from_mapping(sheets: list, mapping: dict):
+    sheet = next((s for s in sheets if s.name == mapping.get("sheet")), sheets[0])
+    r = max(int(mapping.get("header_row", 1)) - 1, 0)
+    cols = {k: int(v) for k, v in (mapping.get("cols") or {}).items() if v is not None and int(v) >= 0}
+    if "name" not in cols:
+        raise ValueError("Choose which column holds the activity names.")
+    h = HeaderInfo(r, cols, 0.0)
+    h.timeline, h.timeline_step = _find_timeline(sheet, r, set(cols.values()))
+    if "duration" in cols:
+        h.duration_header = str(sheet.cell(r, cols["duration"]))
+    hdr = sheet.cell(r, cols["start_wk"]) if "start_wk" in cols else ""
+    h.period_unit = mapping.get("period_unit") or header_unit(hdr or "") or "w"
+    if not any(k in cols for k in ("start", "finish", "start_wk")) and len(h.timeline) < 4:
+        raise ValueError("Choose a start date column, a start period column, or a sheet with a Gantt timeline.")
+    return sheet, h
