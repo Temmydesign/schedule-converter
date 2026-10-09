@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
@@ -20,6 +21,7 @@ class Options:
     use_source_logic: bool = True
     hierarchy_mode: Optional[str] = None         # wbs | indent | summary-rows | group | flat
     policy: dict = field(default_factory=dict)   # overrides on firm_policy.json
+    calendar_name: Optional[str] = None          # explicit calendar name (max 51 chars in MS Project)
 
 
 @dataclass
@@ -102,10 +104,57 @@ def convert(data: bytes, filename: str, opts: Optional[Options] = None) -> Resul
         issues.append(("info", "", name[:80], f"Excel row {r_no} ignored: {why}"))
 
     return Result(project, nodes, cal, out_cal, policy,
-                  project_name + policy.get("calendar_name_suffix", " CALENDAR"),
+                  calendar_name_for(project_name, policy, opts.calendar_name),
                   sheet.name, [s[0].name for s in ranked], header.row + 1,
                   {k: v for k, v in header.cols.items()}, rows, ignored, notes, info,
                   anchor, issues, stats, floats)
+
+
+# --------------------------------------------------------------------------- #
+# Calendar name (MS Project rejects calendar names longer than 51 characters)
+# --------------------------------------------------------------------------- #
+MSP_CALENDAR_MAX = 51
+
+
+def calendar_name_for(project_name: str, policy: dict, override: Optional[str] = None) -> str:
+    limit = int(policy.get("calendar_name_max_length", MSP_CALENDAR_MAX))
+    if override and override.strip():
+        return override.strip()[:limit]
+    suffix = policy.get("calendar_name_suffix", " CALENDAR")
+    base = re.sub(r"\s+", " ", project_name).strip()
+
+    def fits(b):
+        return len(b) + len(suffix) <= limit
+
+    steps = [
+        lambda b: re.sub(r"\s*\([^)]*\)", "", b),                                  # drop (notes)
+        lambda b: re.sub(r"\bLevel\s*(\d)\b", r"L\1", b, flags=re.I),             # Level 2 -> L2
+        lambda b: _acronym_first_segment(b),                                        # "NMHIRP Conceptual ..." -> "NMHIRP"
+        lambda b: re.sub(r"\s+-\s+", " ", b),                                       # drop " - "
+        lambda b: re.sub(r"\bSchedule\b", "Sch", b, flags=re.I),
+    ]
+    for step in steps:
+        if fits(base):
+            break
+        base = step(base).strip()
+    if not fits(base):
+        room = limit - len(suffix)
+        cut = base[:room]
+        base = cut.rsplit(" ", 1)[0] if " " in cut and not base[room:room + 1] in ("", " ") else cut
+        base = base.rstrip(" -")
+        words = base.split()
+        while len(words) > 1 and words[-1].lower() in {"and", "of", "the", "for", "&", "at", "in", "with", "to", "-"}:
+            words.pop()
+        base = " ".join(words)
+    return base + suffix
+
+
+def _acronym_first_segment(b: str) -> str:
+    parts = re.split(r"\s+-\s+", b)
+    words = parts[0].split()
+    if len(parts) > 1 and len(words) > 1 and re.fullmatch(r"[A-Z0-9&/]{2,}", words[0]):
+        parts[0] = words[0]
+    return " - ".join(parts)
 
 
 # --------------------------------------------------------------------------- #
