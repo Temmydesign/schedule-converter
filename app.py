@@ -23,11 +23,18 @@ def convert_schedule(uploaded_file, project_title, start_date):
     
     df_raw = pd.read_excel(xls, sheet_name=selected_sheet, skiprows=2)
     
-    # Standardize header
+    # Standardize header from row 0
     df_raw.columns = df_raw.iloc[0]
-    df_data = df_raw.iloc[1:].dropna(subset=['Activity'])
     
-    # Check if 'System' column exists, otherwise assign default 'TRP'
+    # Clean rows: remove empty activities & legend footer rows
+    df_data = df_raw.iloc[1:].dropna(subset=['Activity']).copy()
+    
+    # Coerce date columns and filter out legend rows without valid dates
+    df_data['Start date'] = pd.to_datetime(df_data['Start date'], errors='coerce')
+    df_data['Finish date'] = pd.to_datetime(df_data['Finish date'], errors='coerce')
+    df_data = df_data.dropna(subset=['Start date', 'Finish date'])
+    
+    # Default system column if missing
     if 'System' not in df_data.columns:
         df_data['System'] = 'TRP'
         
@@ -38,7 +45,7 @@ def convert_schedule(uploaded_file, project_title, start_date):
         'Task Name': project_title,
         'Duration': '',
         'Start Date': start_date.strftime("%Y-%m-%d"),
-        'Finish Date': '2027-04-30',
+        'Finish Date': df_data['Finish date'].max().strftime("%Y-%m-%d"),
         'Predecessors': '',
         'Outline Level': 1
     })
@@ -55,8 +62,8 @@ def convert_schedule(uploaded_file, project_title, start_date):
         tasks_list.append({
             'Task Name': f"System: {sys_name}",
             'Duration': '',
-            'Start Date': str(group['Start date'].min()).split(' ')[0],
-            'Finish Date': str(group['Finish date'].max()).split(' ')[0],
+            'Start Date': group['Start date'].min().strftime("%Y-%m-%d"),
+            'Finish Date': group['Finish date'].max().strftime("%Y-%m-%d"),
             'Predecessors': '',
             'Outline Level': 2
         })
@@ -68,10 +75,10 @@ def convert_schedule(uploaded_file, project_title, start_date):
             dur_str = f"{int(dur_val)} wks" if pd.notna(dur_val) and int(dur_val) > 0 else "0 wks"
             
             sub_tasks.append({
-                'Task Name': r['Activity'],
+                'Task Name': str(r['Activity']).strip(),
                 'Duration': dur_str,
-                'Start Date': str(r['Start date']).split(' ')[0],
-                'Finish Date': str(r['Finish date']).split(' ')[0],
+                'Start Date': r['Start date'].strftime("%Y-%m-%d"),
+                'Finish Date': r['Finish date'].strftime("%Y-%m-%d"),
                 'Outline Level': 3
             })
             
@@ -108,8 +115,8 @@ def convert_schedule(uploaded_file, project_title, start_date):
         tasks_list.append({
             'Task Name': m_name,
             'Duration': '0 wks',
-            'Start Date': str(latest_finish).split(' ')[0],
-            'Finish Date': str(latest_finish).split(' ')[0],
+            'Start Date': latest_finish.strftime("%Y-%m-%d"),
+            'Finish Date': latest_finish.strftime("%Y-%m-%d"),
             'Predecessors': m_pred,
             'Outline Level': 3
         })
