@@ -348,7 +348,7 @@ def _is_summary_type(t) -> bool:
 
 
 def extract_rows(sheet: Sheet, h: HeaderInfo, project_start: Optional[dt.date] = None,
-                 dayfirst: Optional[bool] = True):
+                 dayfirst: Optional[bool] = True, days_per_week: int = 5):
     """Return (rows, ignored, notes)."""
     cols = h.cols
     notes = []
@@ -375,7 +375,7 @@ def extract_rows(sheet: Sheet, h: HeaderInfo, project_start: Optional[dt.date] =
         s = h.timeline[first]
         f = h.timeline[last] + dt.timedelta(days=h.timeline_step - 1)
         if h.timeline_step == 7:
-            f = h.timeline[last] + dt.timedelta(days=4)
+            f = h.timeline[last] + dt.timedelta(days=days_per_week - 1)
         mark = str(sheet.cell(r, first)).strip().lower()
         is_ms = len(marked) == 1 and mark in GANTT_MILESTONE_MARKS
         return s, f, is_ms
@@ -402,9 +402,9 @@ def extract_rows(sheet: Sheet, h: HeaderInfo, project_start: Optional[dt.date] =
             if unit is None:
                 unit = "w"
             if fwk is not None:
-                finish = base_for_weeks + dt.timedelta(weeks=int(fwk) - 1, days=4)
+                finish = base_for_weeks + dt.timedelta(weeks=int(fwk) - 1, days=days_per_week - 1)
             elif dur is not None:
-                finish = start + dt.timedelta(weeks=max(int(dur), 1) - 1, days=4)
+                finish = start + dt.timedelta(weeks=max(int(dur), 1) - 1, days=days_per_week - 1)
 
         gantt_ms = False
         if start is None and finish is None and timeline_cols:
@@ -465,23 +465,24 @@ def extract_rows(sheet: Sheet, h: HeaderInfo, project_start: Optional[dt.date] =
         if x.is_summary:
             continue
         if x.start and not x.finish and x.duration is not None:
-            x.finish = _add_working(x.start, x.duration, x.dur_unit or "d")
+            x.finish = _add_working(x.start, x.duration, x.dur_unit or "d", days_per_week)
         if x.finish and not x.start and x.duration is not None:
-            x.start = _add_working(x.finish, -x.duration, x.dur_unit or "d")
+            x.start = _add_working(x.finish, -x.duration, x.dur_unit or "d", days_per_week)
         if x.start and x.finish and x.finish < x.start:
             notes.append(f"Row {x.excel_row}: finish before start - swapped.")
             x.start, x.finish = x.finish, x.start
     return kept, ignored, notes
 
 
-def _add_working(d: dt.date, dur: float, unit: str) -> dt.date:
+def _add_working(d: dt.date, dur: float, unit: str, days_per_week: int = 5) -> dt.date:
     import numpy as np
 
-    days = int(round(dur * (5 if unit == "w" else 1)))
+    mask = [1] * days_per_week + [0] * (7 - days_per_week)
+    days = int(round(dur * (days_per_week if unit == "w" else 1)))
     if days == 0:
         return d
     step = days - 1 if days > 0 else days + 1
-    return np.busday_offset(np.datetime64(d), step, roll="forward").astype(dt.date)
+    return np.busday_offset(np.datetime64(d), step, roll="forward", weekmask=mask).astype(dt.date)
 
 
 def _clean_code(v) -> Optional[str]:

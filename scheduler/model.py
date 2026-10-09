@@ -52,6 +52,8 @@ class WorkCalendar:
         self._bdc = np.busdaycalendar(weekmask=self.weekmask,
                                       holidays=[np.datetime64(h) for h in self.holidays])
         self.origin = self.roll_forward(origin)
+        self.days_per_week = int(sum(self.weekmask))
+        self.working_days = [d for d, m in zip(DAY_NAMES, self.weekmask) if m]
 
     # -- helpers ------------------------------------------------------------ #
     def is_working(self, d: dt.date) -> bool:

@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import builder, cpm, logic, reader
+from . import builder, calendar_detect, cpm, logic, reader
 from .model import Link, WorkCalendar, load_policy
 
 
@@ -22,6 +22,8 @@ class Options:
     hierarchy_mode: Optional[str] = None         # wbs | indent | summary-rows | group | flat
     policy: dict = field(default_factory=dict)   # overrides on firm_policy.json
     calendar_name: Optional[str] = None          # explicit calendar name (max 51 chars in MS Project)
+    work_week: Optional[int] = None              # 5, 6 or 7 working days; None = auto-detect
+    hours_per_day: Optional[float] = None        # None = firm policy
 
 
 @dataclass
@@ -64,13 +66,40 @@ def convert(data: bytes, filename: str, opts: Optional[Options] = None) -> Resul
             choice = match[0]
     sheet, header, _ = choice
 
-    rows, ignored, notes = reader.extract_rows(sheet, header, opts.project_start, opts.dayfirst)
+    # ---------------- work week ---------------- #
+    default_days = policy.get("working_days") or calendar_detect.week_days(5)
+    rows, ignored, notes = reader.extract_rows(sheet, header, opts.project_start, opts.dayfirst,
+                                               len(default_days))
+    if opts.work_week in (5, 6, 7):
+        n_days, why, how = opts.work_week, "set by the planner", "manual"
+    else:
+        n_days, why, how = calendar_detect.detect_work_week(sheets, rows, default_days)
+    working_days = default_days if (n_days == len(default_days) and how != "manual") \
+        else calendar_detect.week_days(n_days)
+    if len(working_days) != len(default_days):
+        # week-number / Gantt schedules: finish dates depend on the length of the working week
+        rows, ignored, notes = reader.extract_rows(sheet, header, opts.project_start, opts.dayfirst,
+                                                   len(working_days))
+    if opts.hours_per_day:
+        hpd = float(opts.hours_per_day)
+        if abs(hpd - float(policy.get("hours_per_day", 8))) > 1e-9:
+            h0, m0 = (int(x) for x in str(policy.get("day_start", "08:00")).split(":"))
+            lunch = 1 if policy.get("lunch_break") else 0
+            end = h0 * 60 + m0 + int(round((hpd + lunch) * 60))
+            if end > 24 * 60:                     # long shifts: no lunch split, start earlier if needed
+                policy["lunch_break"] = []
+                end = min(h0 * 60 + m0 + int(round(hpd * 60)), 24 * 60)
+                h0 = max(0, (end - int(round(hpd * 60))) // 60)
+                policy["day_start"] = f"{h0:02d}:00"
+            policy["day_finish"] = f"{end // 60:02d}:{end % 60:02d}" if end < 24 * 60 else "23:59"
+        policy["hours_per_day"] = hpd
+    policy["working_days"] = working_days
+
     dated = [r for r in rows if r.start or r.finish]
     if not dated:
         raise ValueError(f"Sheet '{sheet.name}' has activities but no usable dates.")
     excel_start = min((r.start or r.finish) for r in dated)
 
-    working_days = policy.get("working_days")
     cal = WorkCalendar(excel_start, working_days, opts.holidays, policy.get("hours_per_day", 8))
     out_start = opts.project_start or excel_start
     out_cal = WorkCalendar(out_start, working_days, opts.holidays, policy.get("hours_per_day", 8))
@@ -87,13 +116,16 @@ def convert(data: bytes, filename: str, opts: Optional[Options] = None) -> Resul
     sched = [n for n in nodes if n.kind in ("task", "milestone")]
     src_linked, src_problems = set(), []
     if opts.use_source_logic and "preds" in header.cols:
-        src_linked, src_problems = logic.apply_source_logic(nodes, info.get("duration_unit", "d"))
+        src_linked, src_problems = logic.apply_source_logic(nodes, info.get("duration_unit", "d"),
+                                                            cal.days_per_week)
     to_infer = set(n for n in sched if n not in src_linked)
-    anchor = logic.infer_logic(sched, policy, only=to_infer)
+    anchor = logic.infer_logic(sched, policy, only=to_infer, dpw=cal.days_per_week)
     logic.link_completion_milestones(project)
     if policy.get("close_open_ends"):
         info["open_ends_closed"] = logic.close_open_ends(nodes)
     info["logic_source"] = ("spreadsheet + inferred" if src_linked else "inferred from dates")
+    info["work_week"] = {"days": cal.days_per_week, "label": calendar_detect.LABEL[cal.days_per_week],
+                         "reason": why, "source": how, "hours_per_day": policy.get("hours_per_day", 8)}
 
     # ---------------- verify (CPM) ---------------- #
     cpm.forward_pass(nodes, 0)
@@ -197,7 +229,7 @@ def quality_checks(nodes, cal, out_cal, rows, header, anchor, floats, src_proble
         if r.duration is None or not (r.start and r.finish) or n.kind != "task":
             continue
         wd = cal.working_days_between(r.start, r.finish)
-        exp = r.duration * (5 if (r.dur_unit or "d") == "w" else 1)
+        exp = r.duration * (cal.days_per_week if (r.dur_unit or "d") == "w" else 1)
         if abs(wd - exp) > 0.01:
             issues.append(("warning", n.id, n.name,
                            f"Excel duration {r.duration:g} {r.dur_unit or 'd'} does not match its dates "
@@ -291,7 +323,7 @@ def apply_edited_predecessors(res: Result, edits: dict):
             if p.is_summary or p is n:
                 continue
             links.append(Link(p, (m.group("type") or "FS").upper(),
-                              logic._lag_days(m.group("lag"), unit), "edited by planner"))
+                              logic._lag_days(m.group("lag"), unit, res.cal.days_per_week), "edited by planner"))
         n.preds = links
     for n in res.nodes:
         n.es = n.ef = None

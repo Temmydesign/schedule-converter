@@ -49,27 +49,27 @@ def _key(n: Node):
     return (n.t_start, n.order)
 
 
-def _fmt_lag(days: int, unit: str) -> str:
+def _fmt_lag(days: int, unit: str, dpw: int = 5) -> str:
     if days == 0:
         return ""
     sign = "+" if days > 0 else "-"
     d = abs(days)
-    if unit == "w" and d % 5 == 0:
-        w = d // 5
+    if unit == "w" and d % dpw == 0:
+        w = d // dpw
         return f"{sign}{w} wk" if w == 1 else f"{sign}{w} wks"
     return f"{sign}{d} day" if d == 1 else f"{sign}{d} days"
 
 
-def link_text(link: Link, unit: str = "w") -> str:
-    return f"{link.pred.id}{link.type}{_fmt_lag(link.lag, unit)}"
+def link_text(link: Link, unit: str = "w", dpw: int = 5) -> str:
+    return f"{link.pred.id}{link.type}{_fmt_lag(link.lag, unit, dpw)}"
 
 
 # --------------------------------------------------------------------------- #
 # Inference
 # --------------------------------------------------------------------------- #
-def infer_logic(items: list, policy: dict, only: Optional[set] = None):
+def infer_logic(items: list, policy: dict, only: Optional[set] = None, dpw: int = 5):
     """Attach predecessors to every schedulable item (except the anchor)."""
-    max_lead = int(round(float(policy.get("max_lead_weeks", 2)) * 5))
+    max_lead = int(round(float(policy.get("max_lead_weeks", 2)) * dpw))
     items = [n for n in items if n.t_start is not None]
     if not items:
         return None
@@ -160,7 +160,7 @@ _TOKEN = re.compile(
 )
 
 
-def _lag_days(text: str, default_unit: str) -> int:
+def _lag_days(text: str, default_unit: str, dpw: int = 5) -> int:
     if not text:
         return 0
     m = re.match(r"([+-])\s*(\d+(?:\.\d+)?)\s*([a-z]*)", text.strip().lower())
@@ -169,15 +169,15 @@ def _lag_days(text: str, default_unit: str) -> int:
     v = float(m.group(2)) * (1 if m.group(1) == "+" else -1)
     u = m.group(3) or default_unit
     if u.startswith("w"):
-        v *= 5
+        v *= dpw
     elif u.startswith("mo"):
-        v *= 20
+        v *= round(dpw * 52 / 12)
     elif u.startswith("h"):
         v /= 8
     return int(round(v))
 
 
-def apply_source_logic(nodes: list, default_unit: str = "d"):
+def apply_source_logic(nodes: list, default_unit: str = "d", dpw: int = 5):
     """Parse predecessor text found in the spreadsheet. Returns (linked set, problems)."""
     keys = {}
     srcs = [n for n in nodes if n.src is not None]
@@ -211,7 +211,7 @@ def apply_source_logic(nodes: list, default_unit: str = "d"):
                     continue
                 P = cm
             typ = (m.group("type") or "FS").upper() if m else "FS"
-            lag = _lag_days(m.group("lag"), default_unit) if m else 0
+            lag = _lag_days(m.group("lag"), default_unit, dpw) if m else 0
             links.append(Link(P, typ, lag, "from spreadsheet"))
         if links:
             n.preds = links

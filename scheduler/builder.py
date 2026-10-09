@@ -35,7 +35,7 @@ def infer_duration_unit(rows: list, cal: WorkCalendar) -> str:
         if r.is_summary or r.duration in (None, 0) or not (r.start and r.finish):
             continue
         wd = cal.working_days_between(r.start, r.finish)
-        if abs(wd - r.duration * 5) < 0.01:
+        if abs(wd - r.duration * cal.days_per_week) < 0.01:
             votes["w"] += 1
         elif abs(wd - r.duration) < 0.01:
             votes["d"] += 1

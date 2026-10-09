@@ -21,11 +21,17 @@ def clean_text(s: str) -> str:
     return unicodedata.normalize("NFC", s).strip()
 
 
-def duration_text(n) -> str:
+def shown_unit(n, dpw: int = 5) -> str:
+    # Weeks are only shown for a 5-day week: MS Project's CSV import converts "wks" with its
+    # default 40 h/week, so 6- and 7-day calendars are written in days to stay exact.
+    return n.dur_unit if dpw == 5 else "d"
+
+
+def duration_text(n, dpw: int = 5) -> str:
     if n.is_summary:
         return ""
     d = n.dur
-    if n.dur_unit == "w" and d % 5 == 0:
+    if shown_unit(n, dpw) == "w" and d % 5 == 0:
         w = d // 5
         return "1 wk" if w == 1 else f"{w} wks"
     return "1 day" if d == 1 else f"{d} days"
@@ -33,14 +39,15 @@ def duration_text(n) -> str:
 
 def schedule_table(res) -> pd.DataFrame:
     """The import table (one row per MS Project task) using output dates."""
+    dpw = res.out_cal.days_per_week
     rows = []
     for n in res.nodes:
         s, f = cpm.display_dates(n, res.out_cal)
-        preds = ", ".join(link_text(l, n.dur_unit) for l in n.preds)
+        preds = ", ".join(link_text(l, shown_unit(n, dpw), dpw) for l in n.preds)
         rows.append({
             "ID": n.id,
             "Task Name": clean_text(n.name),
-            "Duration": duration_text(n),
+            "Duration": duration_text(n, dpw),
             "Start Date": s,
             "Finish Date": f,
             "Predecessors": preds,
@@ -89,6 +96,7 @@ def _dur_iso(days: float, hpd: float) -> str:
 def to_mspdi(res, author: str = "Naphtali PM Group") -> bytes:
     pol = res.policy
     cal = res.out_cal
+    dpw = cal.days_per_week
     hpd = float(pol.get("hours_per_day", 8))
     ds, df_ = _hm(pol.get("day_start", "08:00")), _hm(pol.get("day_finish", "17:00"))
     lunch = pol.get("lunch_break") or []
@@ -128,10 +136,10 @@ def to_mspdi(res, author: str = "Naphtali PM Group") -> bytes:
     sub(P, "DefaultStartTime", f"{ds[0]:02d}:{ds[1]:02d}:00")
     sub(P, "DefaultFinishTime", f"{df_[0]:02d}:{df_[1]:02d}:00")
     sub(P, "MinutesPerDay", int(hpd * 60))
-    sub(P, "MinutesPerWeek", int(hpd * 60 * 5))
-    sub(P, "DaysPerMonth", 20)
+    sub(P, "MinutesPerWeek", int(hpd * 60 * dpw))
+    sub(P, "DaysPerMonth", int(round(dpw * 52 / 12)))
     sub(P, "DefaultTaskType", 1)
-    sub(P, "DurationFormat", 9 if res.info.get("duration_unit") == "w" else 7)
+    sub(P, "DurationFormat", 9 if (res.info.get("duration_unit") == "w" and dpw == 5) else 7)
     sub(P, "WorkFormat", 2)
     sub(P, "HonorConstraints", 1)
     sub(P, "NewTasksEffortDriven", 0)
@@ -151,7 +159,7 @@ def to_mspdi(res, author: str = "Naphtali PM Group") -> bytes:
     sub(c, "BaseCalendarUID", -1)
     wds = sub(c, "WeekDays")
     names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-    working = set(pol.get("working_days") or ["Mon", "Tue", "Wed", "Thu", "Fri"])
+    working = set(cal.working_days)
     for i, nm in enumerate(names, start=1):
         wd = sub(wds, "WeekDay")
         sub(wd, "DayType", i)
@@ -209,7 +217,7 @@ def to_mspdi(res, author: str = "Naphtali PM Group") -> bytes:
             sub(t, "Start", start_dt(n.es))
             sub(t, "Finish", finish_dt(n.ef))
         sub(t, "Duration", _dur_iso(n.dur, hpd))
-        sub(t, "DurationFormat", 9 if (n.dur_unit == "w" and n.dur % 5 == 0) else 7)
+        sub(t, "DurationFormat", 9 if (shown_unit(n, dpw) == "w" and n.dur % 5 == 0) else 7)
         sub(t, "ResumeValid", 0)
         sub(t, "EffortDriven", 0)
         sub(t, "Recurring", 0)
@@ -235,7 +243,7 @@ def to_mspdi(res, author: str = "Naphtali PM Group") -> bytes:
             sub(pl, "Type", {"FF": 0, "FS": 1, "SF": 2, "SS": 3}[l.type])
             sub(pl, "CrossProject", 0)
             sub(pl, "LinkLag", int(round(l.lag * hpd * 60 * 10)))
-            sub(pl, "LagFormat", 9 if (n.dur_unit == "w" and l.lag % 5 == 0) else 7)
+            sub(pl, "LagFormat", 9 if (shown_unit(n, dpw) == "w" and l.lag % 5 == 0) else 7)
 
     ET.indent(P, space="  ")
     body = ET.tostring(P, encoding="utf-8", xml_declaration=False)
