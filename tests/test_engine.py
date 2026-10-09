@@ -204,3 +204,18 @@ def test_close_open_ends_keeps_dates():
                                                         "completion_milestone_for_project_title": True}))
     check(res)
     assert res.stats["open_ends"] == 0
+
+
+def test_calendar_name_fits_ms_project_limit():
+    rows = [["Activity", "Start", "Finish"], ["A", wd(0), wd(9)]]
+    long_name = "NMHIRP Conceptual Design Study - Trans Ramos Pipeline - Level 2 Schedule"
+    res = convert(book(rows), "n.xlsx", Options(project_name=long_name))
+    assert len(res.calendar_name) <= 51 and res.calendar_name.endswith(" CALENDAR")
+    assert res.calendar_name == "NMHIRP Trans Ramos Pipeline L2 Schedule CALENDAR"
+    root = ET.fromstring(exporters.to_mspdi(res))
+    ns = "{http://schemas.microsoft.com/project}"
+    assert len(root.find(f"{ns}Calendars/{ns}Calendar/{ns}Name").text) <= 51
+    short = convert(book(rows), "n.xlsx", Options(project_name="Test Project"))
+    assert short.calendar_name == "Test Project CALENDAR"
+    own = convert(book(rows), "n.xlsx", Options(project_name=long_name, calendar_name="TRP L2 CALENDAR"))
+    assert own.calendar_name == "TRP L2 CALENDAR"
