@@ -18,6 +18,11 @@ Live app: `https://schedule-converter.streamlit.app` (Streamlit Community Cloud)
 | Verify | A CPM engine that schedules the way MS Project does (forward/backward pass, standard calendar plus holidays) recalculates the schedule and compares every activity with the Excel. Any date difference is reported, so the file is checked before it reaches MS Project. |
 | Output | Import-ready **CSV** (same 8 columns as before) · **MS Project XML** (opens directly, with calendar, start date, auto-scheduling) · **Primavera P6 XER** · **QA report** (Excel: summary, issues, traceability to Excel rows, float). |
 
+Work week: detected automatically (Mon–Fri, Mon–Sat or Mon–Sun) from weekend dates, day-based
+durations and wording such as "6-day week" or "24/7"; firm default Mon–Fri. Override it, and the hours per
+day, in the sidebar. On 6- and 7-day calendars durations and lags are written in days so MS Project
+imports them exactly.
+
 Extras in the app: a sidebar for policy settings (max lead, close open ends, holidays, date format), a
 re-baseline option (move the whole schedule to a new start/NTP date), predecessors you can edit and
 re-verify, a Gantt preview with the critical path, and an optional AI planning review.
