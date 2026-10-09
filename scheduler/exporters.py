@@ -281,7 +281,56 @@ def to_xer(res) -> bytes:
         project = UniversalProjectReader().read(src)
         UniversalProjectWriter(FileFormat.XER).write(project, dst)
         with open(dst, "rb") as fh:
-            return fh.read()
+            raw = fh.read()
+    return _patch_xer(raw, res, str(res.policy.get("p6_xer_version", XER_VERSION)))
+
+
+XER_VERSION = "19.12"   # P6 refuses XER files from a newer version; 19.12 opens in P6 19 and later
+
+
+def _patch_xer(raw: bytes, res, version: str = XER_VERSION) -> bytes:
+    """Make the XER import cleanly in P6 19+: version header, activity types, planned dates, data date."""
+    text = raw.decode("cp1252", errors="replace")
+    lines = text.split("\r\n") if "\r\n" in text else text.split("\n")
+    cal = res.out_cal
+    by_uid = {n.uid: n for n in res.nodes}
+
+    def p6(d, hm):
+        return f"{d:%Y-%m-%d} {hm}"
+
+    out, table, fields = [], None, []
+    for line in lines:
+        cols = line.split("\t")
+        if cols[0] == "ERMHDR" and len(cols) > 1:
+            cols[1] = version
+        elif cols[0] == "%T":
+            table = cols[1] if len(cols) > 1 else None
+        elif cols[0] == "%F":
+            fields = cols[1:]
+        elif cols[0] == "%R" and table in ("TASK", "PROJECT"):
+            rec = dict(zip(fields, cols[1:] + [""] * (len(fields) - len(cols) + 1)))
+            if table == "PROJECT":
+                start = p6(cal.date(0), "08:00")
+                rec["last_recalc_date"] = rec.get("last_recalc_date") or start   # data date
+                rec["plan_start_date"] = rec.get("plan_start_date") or start
+                rec["def_task_type"] = "TT_Task"
+            else:
+                n = by_uid.get(int(rec.get("task_id") or -1))
+                if n is not None:
+                    s, f = cpm.display_dates(n, cal)
+                    if n.is_milestone:
+                        start_ms = not n.ms_end_of_day
+                        rec["task_type"] = "TT_Mile" if start_ms else "TT_FinMile"
+                        stamp = p6(s, "08:00") if start_ms else p6(f, "17:00")
+                        rec["target_start_date"] = rec["target_end_date"] = stamp
+                        rec["early_start_date"] = rec["early_end_date"] = stamp
+                    else:
+                        rec["task_type"] = "TT_Task"
+                        rec["target_start_date"] = rec["early_start_date"] = p6(s, "08:00")
+                        rec["target_end_date"] = rec["early_end_date"] = p6(f, "17:00")
+            cols = ["%R"] + [rec.get(k, "") for k in fields]
+        out.append("\t".join(cols))
+    return "\r\n".join(out).encode("cp1252", errors="replace")
 
 
 # --------------------------------------------------------------------------- #
