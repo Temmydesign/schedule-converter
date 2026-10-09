@@ -154,6 +154,10 @@ with st.sidebar:
         use_src = st.toggle("Use workbook predecessors", value=True,
                             help="If the workbook already has a Predecessors column, keep its logic.")
     with st.expander("Calendar", icon=":material/calendar_month:"):
+        week_choice = st.selectbox("Work week", ["Auto-detect", "Mon–Fri", "Mon–Sat", "Mon–Sun"],
+                                   help="Auto-detect reads weekend dates, durations and wording in the workbook.")
+        work_week = {"Mon–Fri": 5, "Mon–Sat": 6, "Mon–Sun": 7}.get(week_choice)
+        hours = st.number_input("Hours per day", 4.0, 24.0, float(POLICY.get("hours_per_day", 8)), 0.5)
         dayfirst = st.radio("Text dates", ["dd/mm/yyyy", "mm/dd/yyyy"], index=0, horizontal=True) == "dd/mm/yyyy"
         hol_text = st.text_area("Holidays (yyyy-mm-dd, one per line)", "", height=110)
     st.caption("Files are never stored.")
@@ -185,6 +189,7 @@ data = up.getvalue()
 file_sig = hashlib.md5(data).hexdigest()
 
 base_opts = Options(dayfirst=dayfirst, holidays=holidays, use_source_logic=use_src,
+                    work_week=work_week, hours_per_day=hours,
                     policy={"max_lead_weeks": max_lead, "close_open_ends": close_ends,
                             "completion_milestone_for_project_title": proj_ms})
 try:
@@ -207,7 +212,8 @@ with st.expander("Project settings", icon=":material/tune:"):
                           help="Change to move the whole schedule to a new start date.")
     if sheet != probe.sheet_name:
         probe = convert(data, up.name, Options(sheet_name=sheet, dayfirst=dayfirst, holidays=holidays,
-                                               use_source_logic=use_src, policy=base_opts.policy))
+                                               use_source_logic=use_src, policy=base_opts.policy,
+                                               work_week=work_week, hours_per_day=hours))
     name = st.text_input("Project name", probe.project.name)
     auto_cal = calendar_name_for(name, {**POLICY, **base_opts.policy})
     cal_name = st.text_input("Calendar name", auto_cal, max_chars=51, key=f"cal-{auto_cal}",
@@ -216,7 +222,7 @@ with st.expander("Project settings", icon=":material/tune:"):
 opts = Options(sheet_name=sheet, project_name=name, calendar_name=cal_name, dayfirst=dayfirst, holidays=holidays,
                use_source_logic=use_src, hierarchy_mode=mode,
                project_start=start if start != probe.stats["excel_start"] else None,
-               policy=base_opts.policy)
+               work_week=work_week, hours_per_day=hours, policy=base_opts.policy)
 res = convert(data, up.name, opts)
 
 edit_key = f"edits-{file_sig}-{sheet}-{mode}"
@@ -229,7 +235,11 @@ stt = res.stats
 # Result
 # --------------------------------------------------------------------------- #
 esc = html.escape
-chips = "".join(f'<span class="sc-chip">{esc(c)}</span>' for c in [res.sheet_name, modes.get(res.info["mode"], "")])
+ww = res.info["work_week"]
+ww_chip = f'{ww["label"]} · {ww["hours_per_day"]:g} h/day' + (" · auto" if ww["source"] != "manual" else "")
+chips = "".join(f'<span class="sc-chip" title="{esc(t)}">{esc(c)}</span>' for c, t in [
+    (res.sheet_name, "Schedule sheet"), (modes.get(res.info["mode"], ""), "Outline source"),
+    (ww_chip, f"Work week: {ww['reason']}")])
 st.markdown(f'<div class="sc-proj"><h2>{esc(res.project.name)}</h2><div>{chips}</div></div>',
             unsafe_allow_html=True)
 
@@ -240,14 +250,15 @@ WARN = ('<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="cur
 n_items = stt["activities"] + stt["milestones"]
 ok = stt["date_mismatches"] == 0 and stt["finish_matches"]
 if ok:
-    head, sub = "All dates match the Excel", f"{n_items} of {n_items} activities verified"
+    head, sub = "All dates match the Excel", f"{n_items} of {n_items} activities verified on a {ww['label']} week"
 else:
     head, sub = (f"{stt['date_mismatches']} date{'s' if stt['date_mismatches'] != 1 else ''} differ from the Excel",
                  "See Quality checks")
 st.markdown(
     f"""<div class="sc-verdict {'ok' if ok else 'bad'}">
       <div class="seal">{CHECK if ok else WARN}</div>
-      <div><h3>{head}</h3><div class="sub">{sub}</div></div>
+      <div><h3>{head}</h3><div class="sub">{sub}</div>
+        <div class="sub" style="font-size:.8rem">Work week {'set manually' if ww['source'] == 'manual' else 'detected: ' + esc(ww['reason'])}</div></div>
       <div class="finish"><span>Finish</span><b>{stt['output_finish']:%d %b %Y}</b>
         <span>{stt['duration_days']} working days</span></div>
     </div>""", unsafe_allow_html=True)
@@ -392,7 +403,8 @@ Calendar *{res.calendar_name}* and start date are already set.
 #### Import CSV
 1. **File › Open** › type **CSV** › **New map** › **Tasks**, headers on
 2. Map the 7 columns to the same-named MS Project fields
-3. Set start **{stt['output_start']:%d %b %Y}** and the calendar, then **Auto Schedule** all
+3. Set start **{stt['output_start']:%d %b %Y}** and a **{ww['label']}**, {ww['hours_per_day']:g} h/day calendar,
+   then **Auto Schedule** all
 """)
     st.caption("Primavera P6: File › Import › XER (or Microsoft Project XML), then F9.")
 
