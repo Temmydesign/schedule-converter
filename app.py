@@ -1,6 +1,9 @@
-"""Naphtali PM Group - Schedule Converter (Streamlit web app).
+"""Naphtali PM Group - Schedule Converter / AutoSchedule Engine (Streamlit web app).
 
-Upload any Excel schedule -> policy-compliant, verified MS Project / Primavera P6 files.
+Two ways in, one proven engine out:
+1. Excel schedule converter  - any workbook -> policy-compliant, verified MS Project / Primavera P6 files.
+2. Document scope ingestion  - SOW / charter / scope narrative (.docx, .pdf, .txt) -> Gemini extraction ->
+   planner Review Gate -> deterministic CPM baseline -> the same verified exports.
 """
 from __future__ import annotations
 
@@ -13,7 +16,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from scheduler import exporters
+from scheduler import dcma, exporters
+from scheduler import scope_builder as sb
+from scheduler.doc_reader import DocumentReadError, read_document
 from scheduler.engine import (NoScheduleFound, Options, apply_edited_predecessors, calendar_name_for, convert,
                               inspect_layout)
 from scheduler.model import load_policy
@@ -63,6 +68,17 @@ st.markdown(
       .sc-step .n {{flex: none; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center;
                     background: {SURF2}; color: {BLUE}; font-family: Archivo, sans-serif; font-weight: 700;}}
       @media (max-width: 760px) {{ .sc-steps {{grid-template-columns: 1fr;}} }}
+
+      .sc-wiz {{display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .6rem; margin: .4rem 0 1.1rem;}}
+      .sc-wiz .s {{display: flex; align-items: center; gap: .6rem; padding: .65rem .8rem; border-radius: 12px;
+                   background: {SURF}; border: 1px solid {LINE}; color: {MUTED}; font-weight: 600; font-size: .92rem;}}
+      .sc-wiz .s .n {{flex: none; width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center;
+                      background: {SURF2}; color: {MUTED}; font-family: Archivo, sans-serif; font-size: .85rem;}}
+      .sc-wiz .s.on {{border-color: {BLUE}; color: #FFFFFF;}}
+      .sc-wiz .s.on .n {{background: {BLUE}; color: #FFFFFF;}}
+      .sc-wiz .s.done {{color: {TEXT};}}
+      .sc-wiz .s.done .n {{background: rgba(63,185,122,.18); color: {GREEN};}}
+      @media (max-width: 760px) {{ .sc-wiz {{grid-template-columns: repeat(2, minmax(0, 1fr));}} }}
 
       .sc-proj {{display: flex; flex-wrap: wrap; align-items: baseline; gap: .4rem 1rem; margin: .3rem 0 .9rem;}}
       .sc-proj h2 {{font-family: Archivo, sans-serif; font-size: 1.5rem; color: #FFFFFF; margin: 0; padding: 0;}}
@@ -132,14 +148,25 @@ GANTT_SVG = f"""
 
 st.markdown(
     f"""<div class="sc-band">
-      <div><h1>{APP_NAME}</h1><p>Excel schedule in. Verified MS Project &amp; P6 files out.</p></div>
+      <div><h1>{APP_NAME}</h1><p>Excel schedules or scope documents in. Verified MS Project &amp; P6 files out.</p></div>
       <div>{GANTT_SVG}</div>
     </div>""",
     unsafe_allow_html=True,
 )
 
+
 # --------------------------------------------------------------------------- #
-# Sidebar: firm policy
+# Secrets (never hard-coded; never echoed)
+# --------------------------------------------------------------------------- #
+def _secret(name: str):
+    try:
+        return st.secrets.get(name)
+    except Exception:  # noqa: BLE001 - no secrets.toml locally
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Sidebar: firm policy + AI extraction
 # --------------------------------------------------------------------------- #
 with st.sidebar:
     st.header("Firm policy")
@@ -149,10 +176,12 @@ with st.sidebar:
         max_lead = st.number_input("Max lead (weeks)", 0.0, 10.0, float(POLICY.get("max_lead_weeks", 2)), 0.5,
                                    help="Longer overlaps use SS + lag instead of FS with a lead.")
         close_ends = st.toggle("Close open ends", value=bool(POLICY.get("close_open_ends", False)),
-                               help="Tie activities with no successor to their summary's completed milestone.")
+                               help="Tie activities with no successor to their summary's completed milestone. "
+                                    "Always on for document scope schedules.")
         proj_ms = st.toggle("Project completed milestone",
                             value=bool(POLICY.get("completion_milestone_for_project_title", False)),
-                            help="Add '<project> completed' under the project title.")
+                            help="Add '<project> completed' under the project title. "
+                                 "Always on for document scope schedules.")
         use_src = st.toggle("Use workbook predecessors", value=True,
                             help="If the workbook already has a Predecessors column, keep its logic.")
         fit_src = st.toggle("Fit workbook links to its dates", value=True,
@@ -160,11 +189,27 @@ with st.sidebar:
                                  "so nothing moves. Every change is listed in File check.")
     with st.expander("Calendar", icon=":material/calendar_month:"):
         week_choice = st.selectbox("Work week", ["Auto-detect", "Mon–Fri", "Mon–Sat", "Mon–Sun"],
-                                   help="Auto-detect reads weekend dates, durations and wording in the workbook.")
+                                   help="Auto-detect reads weekend dates, durations and wording in the workbook. "
+                                        "For documents it uses the working week the document states, else Mon–Fri.")
         work_week = {"Mon–Fri": 5, "Mon–Sat": 6, "Mon–Sun": 7}.get(week_choice)
         hours = st.number_input("Hours per day", 4.0, 24.0, float(POLICY.get("hours_per_day", 8)), 0.5)
         dayfirst = st.radio("Text dates", ["dd/mm/yyyy", "mm/dd/yyyy"], index=0, horizontal=True) == "dd/mm/yyyy"
         hol_text = st.text_area("Holidays (yyyy-mm-dd, one per line)", "", height=110)
+
+    st.header("AI extraction")
+    secret_key = _secret("GEMINI_API_KEY")
+    gemini_model = _secret("GEMINI_MODEL") or "gemini-2.5-flash"
+    with st.expander("Gemini", icon=":material/key:", expanded=not secret_key):
+        if secret_key:
+            st.success("API key loaded from Streamlit secrets.", icon=":material/lock:")
+            gemini_key = secret_key
+        else:
+            gemini_key = st.text_input("Gemini API key (local testing)", type="password", key="gemini-key-input",
+                                       help="Used only for this browser session; never stored or logged. "
+                                            "In production set GEMINI_API_KEY in Streamlit secrets.")
+            if not gemini_key:
+                st.caption("No key: document extraction is disabled. The Excel converter works without it.")
+        st.caption(f"Model: `{gemini_model}`")
     st.caption("Files are never stored.")
 
 holidays = []
@@ -176,213 +221,23 @@ for line in hol_text.splitlines():
         except ValueError:
             st.sidebar.warning(f"Ignored holiday '{line}' (use yyyy-mm-dd)")
 
-# --------------------------------------------------------------------------- #
-# Upload
-# --------------------------------------------------------------------------- #
-up = st.file_uploader("Schedule workbook", type=["xlsx", "xlsm", "xls", "csv"], label_visibility="collapsed",
-                      help="Any workbook with activities and dates, start weeks + durations, or a drawn Gantt.")
+SIDEBAR_POLICY = {"max_lead_weeks": max_lead, "close_open_ends": close_ends,
+                  "completion_milestone_for_project_title": proj_ms}
 
-if up is None:
-    st.markdown('<div class="sc-steps"><div class="sc-step"><span class="n">1</span>Upload the workbook</div>'
-                '<div class="sc-step"><span class="n">2</span>Check the dates</div>'
-                '<div class="sc-step"><span class="n">3</span>Download your files</div></div>',
-                unsafe_allow_html=True)
-    st.write("")
-    t1, _ = st.columns([1, 3])
-    t1.download_button("Blank schedule template", exporters.blank_template_xlsx(), "Schedule_Template.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       icon=":material/description:", width="stretch",
-                       help="The standard layout the app reads best. Any other layout works too.")
-    footer()
-    st.stop()
-
-data = up.getvalue()
-file_sig = hashlib.md5(data).hexdigest()
-
-map_key = f"map-{file_sig}"
-mapping = st.session_state.get(map_key)
+modes = {"wbs": "WBS codes", "indent": "Indentation", "summary-rows": "Heading rows",
+         "group": "Group column", "flat": "Flat list"}
 
 FIELDS = [("name", "Activity name *"), ("start", "Start date"), ("finish", "Finish date"),
           ("start_wk", "Start period no."), ("finish_wk", "Finish period no."), ("duration", "Duration"),
           ("wbs", "WBS / outline code"), ("id", "Activity ID / S/N"), ("preds", "Predecessors"),
           ("group", "Group / phase / system"), ("type", "Type (task, milestone, summary)")]
 
-
-def column_mapper(prefill=None, expanded_msg=None):
-    """Manual layout: user tells the app which column is which."""
-    layouts = inspect_layout(data, up.name)
-    if expanded_msg:
-        st.info(expanded_msg, icon=":material/table_view:")
-    names = [l["sheet"] for l in layouts]
-    pre_sheet = (prefill or {}).get("sheet") or names[0]
-    c1, c2, c3 = st.columns([2, 1, 1])
-    sh = c1.selectbox("Sheet", names, index=names.index(pre_sheet) if pre_sheet in names else 0, key="mp-sheet")
-    lay = layouts[names.index(sh)]
-    hr = c2.number_input("Header row", 1, max(lay["rows"], 1),
-                         int((prefill or {}).get("header_row") or lay["header_row"]), key=f"mp-hr-{sh}")
-    pu_opts = {"w": "Weeks", "mo": "Months", "d": "Days"}
-    pu = c3.selectbox("Period numbers are", list(pu_opts), format_func=pu_opts.get,
-                      index=list(pu_opts).index((prefill or {}).get("period_unit") or "w"), key="mp-pu",
-                      help="Only used if Start/Finish are period numbers (Week 1, Month 3 ...).")
-    if hr - 1 != lay["header_row"] - 1:
-        sheet_obj = next(s for s in read_sheets(data, up.name) if s.name == sh)
-        row_vals = sheet_obj.values[hr - 1] if hr - 1 < sheet_obj.nrows else []
-        lay_cols = [(c, f"{col_letter(c)}: {str(v).strip()}" if v not in (None, "") else col_letter(c))
-                    for c, v in enumerate(row_vals)]
-    else:
-        lay_cols = lay["columns"]
-    opts_cols = [None] + [c for c, _ in lay_cols]
-    labels = {None: "—"} | {c: lbl.replace("\n", " ")[:60] for c, lbl in lay_cols}
-    guess = (prefill or {}).get("cols") or lay["guess"]
-    chosen = {}
-    grid = st.columns(3)
-    for i, (k, lbl) in enumerate(FIELDS):
-        g = guess.get(k)
-        chosen[k] = grid[i % 3].selectbox(lbl, opts_cols, format_func=lambda c: labels.get(c, str(c)),
-                                         index=opts_cols.index(g) if g in opts_cols else 0, key=f"mp-{sh}-{k}")
-    b1, b2, _ = st.columns([1, 1, 3])
-    if b1.button("Convert with this mapping", type="primary", icon=":material/play_arrow:"):
-        st.session_state[map_key] = {"sheet": sh, "header_row": int(hr), "period_unit": pu,
-                                     "cols": {k: v for k, v in chosen.items() if v is not None}}
-        st.rerun()
-    if mapping and b2.button("Back to automatic", icon=":material/auto_fix:"):
-        st.session_state.pop(map_key, None)
-        st.rerun()
-
-
-base_opts = Options(dayfirst=dayfirst, holidays=holidays, use_source_logic=use_src, fit_source_logic=fit_src,
-                    work_week=work_week, hours_per_day=hours, mapping=mapping,
-                    policy={"max_lead_weeks": max_lead, "close_open_ends": close_ends,
-                            "completion_milestone_for_project_title": proj_ms})
-try:
-    with st.spinner("Reading the schedule…"):
-        probe = convert(data, up.name, base_opts)
-except NoScheduleFound as exc:
-    column_mapper(None, str(exc))
-    footer()
-    st.stop()
-except Exception as exc:  # noqa: BLE001
-    st.error(f"{up.name} couldn't be converted with this layout: {exc}", icon=":material/error:")
-    column_mapper(mapping, "Check the column mapping and try again.")
-    footer()
-    st.stop()
-
-modes = {"wbs": "WBS codes", "indent": "Indentation", "summary-rows": "Heading rows",
-         "group": "Group column", "flat": "Flat list"}
-
-with st.expander("Project settings", icon=":material/tune:"):
-    c1, c2, c3 = st.columns([2, 1.4, 1.2])
-    sheet = c1.selectbox("Sheet", probe.sheets_found, index=probe.sheets_found.index(probe.sheet_name))
-    mode = c2.selectbox("Outline from", list(modes), format_func=modes.get,
-                        index=list(modes).index(probe.info["mode"]))
-    start = c3.date_input("Start", probe.stats["excel_start"], format="DD/MM/YYYY",
-                          help="Change to move the whole schedule to a new start date.")
-    if sheet != probe.sheet_name:
-        probe = convert(data, up.name, Options(sheet_name=sheet, dayfirst=dayfirst, holidays=holidays,
-                                               use_source_logic=use_src, fit_source_logic=fit_src,
-                                               policy=base_opts.policy,
-                                               work_week=work_week, hours_per_day=hours))
-    name = st.text_input("Project name", probe.project.name)
-    auto_cal = calendar_name_for(name, {**POLICY, **base_opts.policy})
-    cal_name = st.text_input("Calendar name", auto_cal, max_chars=51, key=f"cal-{auto_cal}",
-                             help="MS Project allows at most 51 characters. Long project names are shortened.")
-
-opts = Options(sheet_name=sheet, project_name=name, calendar_name=cal_name, dayfirst=dayfirst, holidays=holidays,
-               use_source_logic=use_src, fit_source_logic=fit_src, hierarchy_mode=mode, mapping=mapping,
-               project_start=start if start != probe.stats["excel_start"] else None,
-               work_week=work_week, hours_per_day=hours, policy=base_opts.policy)
-res = convert(data, up.name, opts)
-
-edit_key = f"edits-{file_sig}-{sheet}-{mode}"
-if st.session_state.get(edit_key):
-    res = apply_edited_predecessors(res, st.session_state[edit_key])
-
-stt = res.stats
-
-# --------------------------------------------------------------------------- #
-# Result
-# --------------------------------------------------------------------------- #
-esc = html.escape
-ww = res.info["work_week"]
-ww_chip = f'{ww["label"]} · {ww["hours_per_day"]:g} h/day' + (" · auto" if ww["source"] != "manual" else "")
-chips = "".join(f'<span class="sc-chip" title="{esc(t)}">{esc(c)}</span>' for c, t in [
-    (res.sheet_name, "Schedule sheet"), (modes.get(res.info["mode"], ""), "Outline source"),
-    (ww_chip, f"Work week: {ww['reason']}")])
-st.markdown(f'<div class="sc-proj"><h2>{esc(res.project.name)}</h2><div>{chips}</div></div>',
-            unsafe_allow_html=True)
-
-# --------------------------------------------------------------------------- #
-# File check
-# --------------------------------------------------------------------------- #
-mp = res.info.get("mapping", {})
-src_warn = [i for i in res.issues if i[0] == "warning"]
-fitted = stt.get("src_links_fitted", 0)
-assumed = res.info.get("assumed_start")
-with st.expander(f"File check{' · ' + str(len(src_warn)) + ' to review' if src_warn else ''}",
-                 icon=":material/fact_check:", expanded=bool(assumed or src_warn)):
-    if assumed:
-        st.warning(f"No calendar dates in the file. Period 1 was set to {stt['output_start']:%a %d %b %Y}. "
-                   f"Set the real start under Project settings.", icon=":material/event:")
-    fc1, fc2 = st.columns([1.3, 1], gap="large")
-    unit_word = {"w": "week", "mo": "month", "d": "day"}.get(res.info.get("period_unit") or "", "")
-    found = []
-    for k, lbl in FIELDS:
-        if k in mp.get("cols", {}):
-            hdr = mp.get("headers", {}).get(k, "")
-            extra = f" ({unit_word} numbers)" if (k in ("start_wk", "finish_wk") and unit_word
-                                                   and unit_word not in hdr.lower()) else ""
-            found.append({"Field": lbl.rstrip(" *"), "Column": col_letter(mp["cols"][k]), "Header in file": hdr + extra})
-    fc1.dataframe(pd.DataFrame(found), hide_index=True, width="stretch")
-    n_read = len([r for r in res.rows if r.start or r.finish])
-    lines = [f"**{n_read}** rows read from **{mp.get('sheet', res.sheet_name)}**, header row {mp.get('header_row', '')}"
-             + (" (mapped by hand)" if mp.get("manual") else ""),
-             f"**{len(res.ignored)}** notes / legend rows ignored",
-             f"Work week **{ww['label']}**: {ww['reason']}"]
-    if "preds" in mp.get("cols", {}):
-        lines.append(f"Workbook logic: **{fitted}** links fitted to the dates, "
-                     f"**{stt.get('src_logic_problems', 0)}** removed or not found")
-    fc2.markdown("\n".join(f"- {x}" for x in lines))
-    if src_warn:
-        fc2.dataframe(pd.DataFrame([{"ID": str(i[1]), "Task": i[2], "Issue": i[3]} for i in src_warn]),
-                      hide_index=True, width="stretch", height=min(38 * len(src_warn) + 38, 260))
-    fb1, fb2, _ = st.columns([1.2, 1, 2])
-    fb1.download_button("Standardised workbook", exporters.to_standard_xlsx(res),
-                        f"{re.sub(r'[^A-Za-z0-9]+', '_', res.project.name).strip('_')[:60]}_Standard.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        icon=":material/table_view:", width="stretch",
-                        help="Your schedule in the standard layout, with dates resolved. Edit it and upload it again.")
-    if fb2.toggle("Map columns by hand", value=bool(mapping), key="mp-toggle"):
-        column_mapper(mp)
-
 CHECK = ('<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" '
          'stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>')
 WARN = ('<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" '
         'stroke-linecap="round"><path d="M12 6v8"/><path d="M12 18h.01"/></svg>')
-n_items = stt["activities"] + stt["milestones"]
-ok = stt["date_mismatches"] == 0 and stt["finish_matches"]
-if ok:
-    head, sub = "All dates match the Excel", f"{n_items} of {n_items} activities verified on a {ww['label']} week"
-else:
-    head, sub = (f"{stt['date_mismatches']} date{'s' if stt['date_mismatches'] != 1 else ''} differ from the Excel",
-                 "See Quality checks")
-st.markdown(
-    f"""<div class="sc-verdict {'ok' if ok else 'bad'}">
-      <div class="seal">{CHECK if ok else WARN}</div>
-      <div><h3>{head}</h3><div class="sub">{sub}</div>
-        <div class="sub" style="font-size:.8rem">Work week {'set manually' if ww['source'] == 'manual' else 'detected: ' + esc(ww['reason'])}</div></div>
-      <div class="finish"><span>Finish</span><b>{stt['output_finish']:%d %b %Y}</b>
-        <span>{stt['duration_days']} working days</span></div>
-    </div>""", unsafe_allow_html=True)
-
-figs = [(stt["activities"], "Activities"), (stt["milestones"] + stt["completion_milestones"], "Milestones"),
-        (stt["summaries"], "Summaries"), (stt["links"], "Links"), (stt["critical"], "Critical")]
-st.markdown('<div class="sc-figs">' + "".join(f'<div class="sc-fig"><b>{v}</b><span>{l}</span></div>'
-                                             for v, l in figs) + "</div>", unsafe_allow_html=True)
-
-# --------------------------------------------------------------------------- #
-# Downloads
-# --------------------------------------------------------------------------- #
-safe = re.sub(r"[^A-Za-z0-9]+", "_", res.project.name).strip("_")[:80] or "Schedule"
+esc = html.escape
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 @st.cache_resource(show_spinner=False)
@@ -390,163 +245,652 @@ def _xer_ok() -> bool:
     return exporters.xer_available()
 
 
-d = st.columns(4, gap="small")
-d[0].download_button("MS Project XML", exporters.to_mspdi(res), f"{safe}.xml", "application/xml",
-                     type="primary", icon=":material/download:", width="stretch",
-                     help="Recommended. Opens in MS Project with calendar, start date and logic already set.")
-d[1].download_button("Import CSV", exporters.to_csv(res), f"{safe}_Import_Ready.csv", "text/csv",
-                     icon=":material/download:", width="stretch",
-                     help="For the MS Project import wizard (usual field mapping).")
-if _xer_ok():
-    try:
-        d[2].download_button("Primavera P6", exporters.to_xer(res), f"{safe}.xer", "application/octet-stream",
-                             icon=":material/download:", width="stretch", help="Native .xer file.")
-    except Exception:  # noqa: BLE001
-        d[2].caption("P6: import the XML")
-else:
-    d[2].caption("P6: import the XML")
-d[3].download_button("QA report", exporters.to_qa_xlsx(res), f"{safe}_QA_Report.xlsx",
-                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                     icon=":material/download:", width="stretch",
-                     help="Excel: date check, logic health, trace to Excel rows.")
-st.write("")
-
 # --------------------------------------------------------------------------- #
-# Tabs
+# Shared result view (verdict, figures, downloads, tabs) - used by both flows
 # --------------------------------------------------------------------------- #
-t_sched, t_gantt, t_qa, t_how = st.tabs([":material/table_rows: Schedule & logic", ":material/view_timeline: Gantt",
-                                         ":material/fact_check: Quality checks", ":material/help: How to open"])
+def render_outputs(res, ns: str, *, ok_head: str, source_word: str, edit_key=None, extra_downloads=None):
+    """Everything after conversion. ns namespaces widget keys so both flows can render on one page."""
+    stt = res.stats
+    ww = res.info["work_week"]
 
-table = exporters.schedule_table(res)
-
-with t_sched:
-    st.caption("Edit **Predecessors**, then **Re-check dates**.")
-    show = table[["ID", "WBS", "Task Name", "Duration", "Start Date", "Finish Date", "Predecessors",
-                  "Outline Level", "_float_days"]].rename(columns={"_float_days": "Float (days)"})
-    show["Task Name"] = [("    " * (lvl - 1)) + n for n, lvl in zip(show["Task Name"], show["Outline Level"])]
-    edited = st.data_editor(
-        show, hide_index=True, width="stretch", height=560, key=f"ed-{edit_key}",
-        disabled=[c for c in show.columns if c != "Predecessors"],
-        column_config={"Start Date": st.column_config.DateColumn(format="DD-MMM-YY"),
-                       "Finish Date": st.column_config.DateColumn(format="DD-MMM-YY"),
-                       "Task Name": st.column_config.TextColumn(width="large")},
-    )
-    b1, b2, _ = st.columns([1, 1.2, 3])
-    if b1.button("Re-check dates", type="primary", icon=":material/rule:"):
-        changes = {int(i): p for i, p, o in zip(edited["ID"], edited["Predecessors"], show["Predecessors"])
-                   if (p or "") != (o or "")}
-        prev = dict(st.session_state.get(edit_key, {}))
-        prev.update(changes)
-        st.session_state[edit_key] = prev
-        st.rerun()
-    if b2.button("Restore automatic logic", icon=":material/restart_alt:"):
-        st.session_state.pop(edit_key, None)
-        st.rerun()
-
-with t_gantt:
-    g = table[table["Start Date"].notna()].copy()
-    fig = go.Figure()
-    colors = {"project": "#C9D6E6", "summary": MUTED, "task": BLUE, "milestone": GOLD, "completion": GREEN}
-    y = [f"{r.ID}  {r['Task Name'][:60]}" for _, r in g.iterrows()]
-    for (_, r), label in zip(g.iterrows(), y):
-        crit = r["_float_days"] is not None and r["_float_days"] == r["_float_days"] and r["_float_days"] <= 0
-        if r["_kind"] in ("milestone", "completion"):
-            fig.add_trace(go.Scatter(x=[pd.Timestamp(r["Finish Date"]) + pd.Timedelta(hours=17)], y=[label],
-                                     mode="markers", marker_symbol="diamond", marker_size=11,
-                                     marker_color=colors[r["_kind"]], showlegend=False,
-                                     hovertext=f"{r['Task Name']}<br>{r['Finish Date']:%d-%b-%y}", hoverinfo="text"))
-        else:
-            s = pd.Timestamp(r["Start Date"])
-            f = pd.Timestamp(r["Finish Date"]) + pd.Timedelta(days=1)
-            thick = 0.35 if r["_kind"] in ("summary", "project") else 0.6
-            col = RED if (crit and r["_kind"] == "task") else colors[r["_kind"]]
-            fig.add_trace(go.Bar(x=[(f - s).total_seconds() * 1000], base=[s], y=[label], orientation="h",
-                                 width=thick, marker_color=col, showlegend=False,
-                                 hovertext=f"{r['Task Name']}<br>{r['Start Date']:%d-%b-%y} → "
-                                           f"{r['Finish Date']:%d-%b-%y}<br>{r['Duration']} · {r['Predecessors']}",
-                                 hoverinfo="text"))
-    fig.update_layout(height=max(420, 24 * len(g) + 80), barmode="overlay", margin=dict(l=10, r=10, t=30, b=10),
-                      paper_bgcolor=SURF, plot_bgcolor=SURF,
-                      font=dict(family="Public Sans, sans-serif", color=TEXT),
-                      hoverlabel=dict(bgcolor=SURF2, font_size=12),
-                      xaxis=dict(type="date", side="top", gridcolor=LINE, linecolor=LINE),
-                      yaxis=dict(autorange="reversed", tickfont=dict(size=11), gridcolor="#152A44"))
-    st.markdown(f'<div style="color:{MUTED};font-size:.88rem;margin:.4rem 0">'
-                f'<span style="color:{RED}">■</span> critical &nbsp;&nbsp; '
-                f'<span style="color:{BLUE}">■</span> activity &nbsp;&nbsp; '
-                f'<span style="color:{GOLD}">◆</span> Excel milestone &nbsp;&nbsp; '
-                f'<span style="color:{GREEN}">◆</span> completed milestone</div>', unsafe_allow_html=True)
-    st.plotly_chart(fig, width="stretch")
-
-with t_qa:
-    q = pd.DataFrame(res.issues, columns=["Severity", "ID", "Task", "Message"])
-    q["ID"] = q["ID"].astype(str)
-    rel = ", ".join(f"{v} {k}" for k, v in sorted(stt["rel_mix"].items()))
-    qa_figs = [(stt["date_mismatches"], "Date differences"),
-               (f"{stt['open_starts']} / {stt['open_ends']}", "Open starts / ends"),
-               (f"{stt['leads']} / {stt['lags']}", "Leads / lags"), (rel, "Link types")]
-    st.markdown('<div class="sc-figs" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:.6rem">'
-                + "".join(f'<div class="sc-fig"><b>{v}</b><span>{l}</span></div>' for v, l in qa_figs)
-                + "</div>", unsafe_allow_html=True)
-    main = q[q["Severity"] != "info"]
-    notes = q[q["Severity"] == "info"]
-    if main.empty:
-        st.success("No errors or warnings.", icon=":material/check_circle:")
+    n_items = stt["activities"] + stt["milestones"]
+    ok = stt["date_mismatches"] == 0 and stt["finish_matches"]
+    if ok:
+        head, sub = ok_head, f"{n_items} of {n_items} activities verified on a {ww['label']} week"
     else:
-        main = main.sort_values("Severity", key=lambda x: x.map({"error": 0, "warning": 1}))
-        st.dataframe(main, hide_index=True, width="stretch")
-    if not notes.empty:
-        with st.expander(f"Notes ({len(notes)})"):
-            st.dataframe(notes[["ID", "Task", "Message"]], hide_index=True, width="stretch")
-    if res.notes:
-        st.info("\n".join(res.notes))
+        head, sub = (f"{stt['date_mismatches']} date{'s' if stt['date_mismatches'] != 1 else ''} differ from the "
+                     f"{source_word}", "See Quality checks")
+    st.markdown(
+        f"""<div class="sc-verdict {'ok' if ok else 'bad'}">
+          <div class="seal">{CHECK if ok else WARN}</div>
+          <div><h3>{head}</h3><div class="sub">{sub}</div>
+            <div class="sub" style="font-size:.8rem">Work week {'set manually' if ww['source'] == 'manual' else 'detected: ' + esc(ww['reason'])}</div></div>
+          <div class="finish"><span>Finish</span><b>{stt['output_finish']:%d %b %Y}</b>
+            <span>{stt['duration_days']} working days</span></div>
+        </div>""", unsafe_allow_html=True)
 
-with t_how:
-    h1, h2 = st.columns(2, gap="large")
-    h1.markdown(f"""
+    figs = [(stt["activities"], "Activities"), (stt["milestones"] + stt["completion_milestones"], "Milestones"),
+            (stt["summaries"], "Summaries"), (stt["links"], "Links"), (stt["critical"], "Critical")]
+    st.markdown('<div class="sc-figs">' + "".join(f'<div class="sc-fig"><b>{v}</b><span>{l}</span></div>'
+                                                 for v, l in figs) + "</div>", unsafe_allow_html=True)
+
+    # ------------------------------ downloads ------------------------------ #
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", res.project.name).strip("_")[:80] or "Schedule"
+    d = st.columns(4, gap="small")
+    d[0].download_button("MS Project XML", exporters.to_mspdi(res), f"{safe}.xml", "application/xml",
+                         type="primary", icon=":material/download:", width="stretch", key=f"{ns}-dl-xml",
+                         help="Recommended. Opens in MS Project with calendar, start date and logic already set.")
+    d[1].download_button("Import CSV", exporters.to_csv(res), f"{safe}_Import_Ready.csv", "text/csv",
+                         icon=":material/download:", width="stretch", key=f"{ns}-dl-csv",
+                         help="For the MS Project import wizard (usual field mapping).")
+    if _xer_ok():
+        try:
+            d[2].download_button("Primavera P6", exporters.to_xer(res), f"{safe}.xer", "application/octet-stream",
+                                 icon=":material/download:", width="stretch", key=f"{ns}-dl-xer",
+                                 help="Native .xer file.")
+        except Exception:  # noqa: BLE001
+            d[2].caption("P6: import the XML")
+    else:
+        d[2].caption("P6: import the XML")
+    d[3].download_button("QA report", exporters.to_qa_xlsx(res), f"{safe}_QA_Report.xlsx", XLSX,
+                         icon=":material/download:", width="stretch", key=f"{ns}-dl-qa",
+                         help=f"Excel: date check, logic health, trace to {source_word} rows.")
+    checks = dcma.dcma14(res)
+    e = st.columns(4, gap="small")
+    e[0].download_button("DCMA-14 report", dcma.dcma_xlsx(res, checks), f"{safe}_DCMA14.xlsx", XLSX,
+                         icon=":material/download:", width="stretch", key=f"{ns}-dl-dcma",
+                         help="DCMA 14-point assessment of the baseline (Excel).")
+    for i, (label, data, fname, mime, tip) in enumerate(extra_downloads or [], start=1):
+        if i < 4:
+            e[i].download_button(label, data, fname, mime, icon=":material/download:", width="stretch",
+                                 key=f"{ns}-dl-extra-{i}", help=tip)
+    st.write("")
+
+    # --------------------------------- tabs -------------------------------- #
+    t_sched, t_gantt, t_qa, t_dcma, t_how = st.tabs(
+        [":material/table_rows: Schedule & logic", ":material/view_timeline: Gantt",
+         ":material/fact_check: Quality checks", ":material/verified: DCMA-14", ":material/help: How to open"],
+        key=f"{ns}-result-tabs")
+
+    table = exporters.schedule_table(res)
+
+    with t_sched:
+        show = table[["ID", "WBS", "Task Name", "Duration", "Start Date", "Finish Date", "Predecessors",
+                      "Outline Level", "_float_days"]].rename(columns={"_float_days": "Float (days)"})
+        show["Task Name"] = [("    " * (lvl - 1)) + n for n, lvl in zip(show["Task Name"], show["Outline Level"])]
+        cfg = {"Start Date": st.column_config.DateColumn(format="DD-MMM-YY"),
+               "Finish Date": st.column_config.DateColumn(format="DD-MMM-YY"),
+               "Task Name": st.column_config.TextColumn(width="large")}
+        if edit_key:
+            st.caption("Edit **Predecessors**, then **Re-check dates**.")
+            edited = st.data_editor(show, hide_index=True, width="stretch", height=560, key=f"ed-{edit_key}",
+                                    disabled=[c for c in show.columns if c != "Predecessors"], column_config=cfg)
+            b1, b2, _ = st.columns([1, 1.2, 3])
+            if b1.button("Re-check dates", type="primary", icon=":material/rule:", key=f"{ns}-recheck"):
+                changes = {int(i): p for i, p, o in zip(edited["ID"], edited["Predecessors"], show["Predecessors"])
+                           if (p or "") != (o or "")}
+                prev = dict(st.session_state.get(edit_key, {}))
+                prev.update(changes)
+                st.session_state[edit_key] = prev
+                st.rerun()
+            if b2.button("Restore automatic logic", icon=":material/restart_alt:", key=f"{ns}-restore"):
+                st.session_state.pop(edit_key, None)
+                st.rerun()
+        else:
+            st.caption("Read-only. Logic comes from the approved scope register: change it in the Review Gate.")
+            st.dataframe(show, hide_index=True, width="stretch", height=560, column_config=cfg)
+
+    with t_gantt:
+        g = table[table["Start Date"].notna()].copy()
+        fig = go.Figure()
+        colors = {"project": "#C9D6E6", "summary": MUTED, "task": BLUE, "milestone": GOLD, "completion": GREEN}
+        y = [f"{r.ID}  {r['Task Name'][:60]}" for _, r in g.iterrows()]
+        for (_, r), label in zip(g.iterrows(), y):
+            crit = r["_float_days"] is not None and r["_float_days"] == r["_float_days"] and r["_float_days"] <= 0
+            if r["_kind"] in ("milestone", "completion"):
+                fig.add_trace(go.Scatter(x=[pd.Timestamp(r["Finish Date"]) + pd.Timedelta(hours=17)], y=[label],
+                                         mode="markers", marker_symbol="diamond", marker_size=11,
+                                         marker_color=colors[r["_kind"]], showlegend=False,
+                                         hovertext=f"{r['Task Name']}<br>{r['Finish Date']:%d-%b-%y}",
+                                         hoverinfo="text"))
+            else:
+                s = pd.Timestamp(r["Start Date"])
+                f = pd.Timestamp(r["Finish Date"]) + pd.Timedelta(days=1)
+                thick = 0.35 if r["_kind"] in ("summary", "project") else 0.6
+                col = RED if (crit and r["_kind"] == "task") else colors[r["_kind"]]
+                fig.add_trace(go.Bar(x=[(f - s).total_seconds() * 1000], base=[s], y=[label], orientation="h",
+                                     width=thick, marker_color=col, showlegend=False,
+                                     hovertext=f"{r['Task Name']}<br>{r['Start Date']:%d-%b-%y} → "
+                                               f"{r['Finish Date']:%d-%b-%y}<br>{r['Duration']} · {r['Predecessors']}",
+                                     hoverinfo="text"))
+        fig.update_layout(height=max(420, 24 * len(g) + 80), barmode="overlay", margin=dict(l=10, r=10, t=30, b=10),
+                          paper_bgcolor=SURF, plot_bgcolor=SURF,
+                          font=dict(family="Public Sans, sans-serif", color=TEXT),
+                          hoverlabel=dict(bgcolor=SURF2, font_size=12),
+                          xaxis=dict(type="date", side="top", gridcolor=LINE, linecolor=LINE),
+                          yaxis=dict(autorange="reversed", tickfont=dict(size=11), gridcolor="#152A44"))
+        st.markdown(f'<div style="color:{MUTED};font-size:.88rem;margin:.4rem 0">'
+                    f'<span style="color:{RED}">■</span> critical &nbsp;&nbsp; '
+                    f'<span style="color:{BLUE}">■</span> activity &nbsp;&nbsp; '
+                    f'<span style="color:{GOLD}">◆</span> {esc(source_word)} milestone &nbsp;&nbsp; '
+                    f'<span style="color:{GREEN}">◆</span> completed milestone</div>', unsafe_allow_html=True)
+        st.plotly_chart(fig, width="stretch", key=f"{ns}-gantt")
+
+    with t_qa:
+        q = pd.DataFrame(res.issues, columns=["Severity", "ID", "Task", "Message"])
+        q["ID"] = q["ID"].astype(str)
+        rel = ", ".join(f"{v} {k}" for k, v in sorted(stt["rel_mix"].items()))
+        qa_figs = [(stt["date_mismatches"], "Date differences"),
+                   (f"{stt['open_starts']} / {stt['open_ends']}", "Open starts / ends"),
+                   (f"{stt['leads']} / {stt['lags']}", "Leads / lags"), (rel, "Link types")]
+        st.markdown('<div class="sc-figs" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:.6rem">'
+                    + "".join(f'<div class="sc-fig"><b>{v}</b><span>{l}</span></div>' for v, l in qa_figs)
+                    + "</div>", unsafe_allow_html=True)
+        main = q[q["Severity"] != "info"]
+        notes = q[q["Severity"] == "info"]
+        if main.empty:
+            st.success("No errors or warnings.", icon=":material/check_circle:")
+        else:
+            main = main.sort_values("Severity", key=lambda x: x.map({"error": 0, "warning": 1}))
+            st.dataframe(main, hide_index=True, width="stretch")
+        if not notes.empty:
+            with st.expander(f"Notes ({len(notes)})"):
+                st.dataframe(notes[["ID", "Task", "Message"]], hide_index=True, width="stretch")
+        if res.notes:
+            st.info("\n".join(res.notes))
+
+    with t_dcma:
+        sm = dcma.summary(checks)
+        st.markdown('<div class="sc-figs" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-top:.6rem">'
+                    f'<div class="sc-fig"><b>{sm["pass"]} / {sm["assessed"]}</b><span>Checks passed</span></div>'
+                    f'<div class="sc-fig"><b>{sm["fail"]}</b><span>Checks failed</span></div>'
+                    f'<div class="sc-fig"><b>{sm["na"]}</b><span>N/A at baseline</span></div></div>',
+                    unsafe_allow_html=True)
+        st.dataframe(dcma.dcma_frame(checks), hide_index=True, width="stretch",
+                     column_config={"#": st.column_config.NumberColumn(width="small"),
+                                    "Detail": st.column_config.TextColumn(width="large")})
+        st.caption("Thresholds follow DCMA 14-Point Assessment and can be changed in firm_policy.json "
+                   "(dcma_* keys). Checks 9, 10, 11 and 14 need progress, resources or a status date.")
+
+    with t_how:
+        h1, h2 = st.columns(2, gap="large")
+        h1.markdown(f"""
 #### MS Project XML
 1. **File › Open** › type **XML Format** › pick the file
 2. **As a new project** › Save as `.mpp`
 
 Calendar *{res.calendar_name}* and start date are already set.
 """)
-    h2.markdown(f"""
+        h2.markdown(f"""
 #### Import CSV
 1. **File › Open** › type **CSV** › **New map** › **Tasks**, headers on
 2. Map the 7 columns to the same-named MS Project fields
 3. Set start **{stt['output_start']:%d %b %Y}** and a **{ww['label']}**, {ww['hours_per_day']:g} h/day calendar,
    then **Auto Schedule** all
 """)
-    st.caption("Primavera P6: File › Import › XER (or Microsoft Project XML), then F9.")
+        st.caption("Primavera P6: File › Import › XER (or Microsoft Project XML), then F9.")
 
-# --------------------------------------------------------------------------- #
-# Optional AI review (only if an Anthropic API key is configured in Streamlit secrets)
-# --------------------------------------------------------------------------- #
-api_key = None
-try:
-    api_key = st.secrets.get("ANTHROPIC_API_KEY")
-except Exception:  # noqa: BLE001 - no secrets file
-    api_key = None
+    # ------------- optional AI review (only if an Anthropic key is configured) ------------- #
+    api_key = _secret("ANTHROPIC_API_KEY")
+    if api_key:
+        with st.expander("AI planning review", icon=":material/psychology:"):
+            st.caption("Sends the converted task list (names, dates, logic) to Claude for a planner's critique.")
+            if st.button("Run AI review", key=f"{ns}-ai-review"):
+                try:
+                    import anthropic
 
-if api_key:
-    with st.expander("AI planning review", icon=":material/psychology:"):
-        st.caption("Sends the converted task list (names, dates, logic) to Claude for a planner's critique.")
-        if st.button("Run AI review"):
+                    client = anthropic.Anthropic(api_key=api_key)
+                    csv_text = exporters.to_csv(res).decode("utf-8", "ignore")
+                    prompt = (
+                        "You are a senior planning engineer (PMI-SP) reviewing a Level 2 schedule converted for "
+                        "MS Project. In under 300 words, flag logic that looks unrealistic, missing hand-overs, "
+                        "excessive leads/lags, and DCMA-14 concerns, then list the top 5 improvements. Be concise."
+                        f"\n\nQA stats: {stt}\n\nSchedule CSV:\n{csv_text}")
+                    msg = client.messages.create(model=_secret("ANTHROPIC_MODEL") or "claude-sonnet-5-5",
+                                                 max_tokens=1200, messages=[{"role": "user", "content": prompt}])
+                    st.markdown("".join(b.text for b in msg.content if getattr(b, "type", "") == "text"))
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"AI review failed: {exc}")
+
+
+# =========================================================================== #
+# Flow 1: Excel schedule converter (unchanged behaviour)
+# =========================================================================== #
+def excel_converter():
+    up = st.file_uploader("Schedule workbook", type=["xlsx", "xlsm", "xls", "csv"], label_visibility="collapsed",
+                          help="Any workbook with activities and dates, start weeks + durations, or a drawn Gantt.")
+
+    if up is None:
+        st.markdown('<div class="sc-steps"><div class="sc-step"><span class="n">1</span>Upload the workbook</div>'
+                    '<div class="sc-step"><span class="n">2</span>Check the dates</div>'
+                    '<div class="sc-step"><span class="n">3</span>Download your files</div></div>',
+                    unsafe_allow_html=True)
+        st.write("")
+        t1, _ = st.columns([1, 3])
+        t1.download_button("Blank schedule template", exporters.blank_template_xlsx(), "Schedule_Template.xlsx",
+                           XLSX, icon=":material/description:", width="stretch",
+                           help="The standard layout the app reads best. Any other layout works too.")
+        return
+
+    data = up.getvalue()
+    file_sig = hashlib.md5(data).hexdigest()
+
+    map_key = f"map-{file_sig}"
+    mapping = st.session_state.get(map_key)
+
+    def column_mapper(prefill=None, expanded_msg=None):
+        """Manual layout: user tells the app which column is which."""
+        layouts = inspect_layout(data, up.name)
+        if expanded_msg:
+            st.info(expanded_msg, icon=":material/table_view:")
+        names = [l["sheet"] for l in layouts]
+        pre_sheet = (prefill or {}).get("sheet") or names[0]
+        c1, c2, c3 = st.columns([2, 1, 1])
+        sh = c1.selectbox("Sheet", names, index=names.index(pre_sheet) if pre_sheet in names else 0, key="mp-sheet")
+        lay = layouts[names.index(sh)]
+        hr = c2.number_input("Header row", 1, max(lay["rows"], 1),
+                             int((prefill or {}).get("header_row") or lay["header_row"]), key=f"mp-hr-{sh}")
+        pu_opts = {"w": "Weeks", "mo": "Months", "d": "Days"}
+        pu = c3.selectbox("Period numbers are", list(pu_opts), format_func=pu_opts.get,
+                          index=list(pu_opts).index((prefill or {}).get("period_unit") or "w"), key="mp-pu",
+                          help="Only used if Start/Finish are period numbers (Week 1, Month 3 ...).")
+        if hr - 1 != lay["header_row"] - 1:
+            sheet_obj = next(s for s in read_sheets(data, up.name) if s.name == sh)
+            row_vals = sheet_obj.values[hr - 1] if hr - 1 < sheet_obj.nrows else []
+            lay_cols = [(c, f"{col_letter(c)}: {str(v).strip()}" if v not in (None, "") else col_letter(c))
+                        for c, v in enumerate(row_vals)]
+        else:
+            lay_cols = lay["columns"]
+        opts_cols = [None] + [c for c, _ in lay_cols]
+        labels = {None: "—"} | {c: lbl.replace("\n", " ")[:60] for c, lbl in lay_cols}
+        guess = (prefill or {}).get("cols") or lay["guess"]
+        chosen = {}
+        grid = st.columns(3)
+        for i, (k, lbl) in enumerate(FIELDS):
+            g = guess.get(k)
+            chosen[k] = grid[i % 3].selectbox(lbl, opts_cols, format_func=lambda c: labels.get(c, str(c)),
+                                             index=opts_cols.index(g) if g in opts_cols else 0, key=f"mp-{sh}-{k}")
+        b1, b2, _ = st.columns([1, 1, 3])
+        if b1.button("Convert with this mapping", type="primary", icon=":material/play_arrow:", key="mp-convert"):
+            st.session_state[map_key] = {"sheet": sh, "header_row": int(hr), "period_unit": pu,
+                                         "cols": {k: v for k, v in chosen.items() if v is not None}}
+            st.rerun()
+        if mapping and b2.button("Back to automatic", icon=":material/auto_fix:", key="mp-auto"):
+            st.session_state.pop(map_key, None)
+            st.rerun()
+
+    base_opts = Options(dayfirst=dayfirst, holidays=holidays, use_source_logic=use_src, fit_source_logic=fit_src,
+                        work_week=work_week, hours_per_day=hours, mapping=mapping, policy=dict(SIDEBAR_POLICY))
+    try:
+        with st.spinner("Reading the schedule…"):
+            probe = convert(data, up.name, base_opts)
+    except NoScheduleFound as exc:
+        column_mapper(None, str(exc))
+        return
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"{up.name} couldn't be converted with this layout: {exc}", icon=":material/error:")
+        column_mapper(mapping, "Check the column mapping and try again.")
+        return
+
+    with st.expander("Project settings", icon=":material/tune:"):
+        c1, c2, c3 = st.columns([2, 1.4, 1.2])
+        sheet = c1.selectbox("Sheet", probe.sheets_found, index=probe.sheets_found.index(probe.sheet_name))
+        mode = c2.selectbox("Outline from", list(modes), format_func=modes.get,
+                            index=list(modes).index(probe.info["mode"]))
+        start = c3.date_input("Start", probe.stats["excel_start"], format="DD/MM/YYYY",
+                              help="Change to move the whole schedule to a new start date.")
+        if sheet != probe.sheet_name:
+            probe = convert(data, up.name, Options(sheet_name=sheet, dayfirst=dayfirst, holidays=holidays,
+                                                   use_source_logic=use_src, fit_source_logic=fit_src,
+                                                   policy=base_opts.policy,
+                                                   work_week=work_week, hours_per_day=hours))
+        name = st.text_input("Project name", probe.project.name)
+        auto_cal = calendar_name_for(name, {**POLICY, **base_opts.policy})
+        cal_name = st.text_input("Calendar name", auto_cal, max_chars=51, key=f"cal-{auto_cal}",
+                                 help="MS Project allows at most 51 characters. Long project names are shortened.")
+
+    opts = Options(sheet_name=sheet, project_name=name, calendar_name=cal_name, dayfirst=dayfirst, holidays=holidays,
+                   use_source_logic=use_src, fit_source_logic=fit_src, hierarchy_mode=mode, mapping=mapping,
+                   project_start=start if start != probe.stats["excel_start"] else None,
+                   work_week=work_week, hours_per_day=hours, policy=base_opts.policy)
+    res = convert(data, up.name, opts)
+
+    edit_key = f"edits-{file_sig}-{sheet}-{mode}"
+    if st.session_state.get(edit_key):
+        res = apply_edited_predecessors(res, st.session_state[edit_key])
+
+    stt = res.stats
+
+    ww = res.info["work_week"]
+    ww_chip = f'{ww["label"]} · {ww["hours_per_day"]:g} h/day' + (" · auto" if ww["source"] != "manual" else "")
+    chips = "".join(f'<span class="sc-chip" title="{esc(t)}">{esc(c)}</span>' for c, t in [
+        (res.sheet_name, "Schedule sheet"), (modes.get(res.info["mode"], ""), "Outline source"),
+        (ww_chip, f"Work week: {ww['reason']}")])
+    st.markdown(f'<div class="sc-proj"><h2>{esc(res.project.name)}</h2><div>{chips}</div></div>',
+                unsafe_allow_html=True)
+
+    # ------------------------------ file check ------------------------------ #
+    mp = res.info.get("mapping", {})
+    src_warn = [i for i in res.issues if i[0] == "warning"]
+    fitted = stt.get("src_links_fitted", 0)
+    assumed = res.info.get("assumed_start")
+    with st.expander(f"File check{' · ' + str(len(src_warn)) + ' to review' if src_warn else ''}",
+                     icon=":material/fact_check:", expanded=bool(assumed or src_warn)):
+        if assumed:
+            st.warning(f"No calendar dates in the file. Period 1 was set to {stt['output_start']:%a %d %b %Y}. "
+                       f"Set the real start under Project settings.", icon=":material/event:")
+        fc1, fc2 = st.columns([1.3, 1], gap="large")
+        unit_word = {"w": "week", "mo": "month", "d": "day"}.get(res.info.get("period_unit") or "", "")
+        found = []
+        for k, lbl in FIELDS:
+            if k in mp.get("cols", {}):
+                hdr = mp.get("headers", {}).get(k, "")
+                extra = f" ({unit_word} numbers)" if (k in ("start_wk", "finish_wk") and unit_word
+                                                       and unit_word not in hdr.lower()) else ""
+                found.append({"Field": lbl.rstrip(" *"), "Column": col_letter(mp["cols"][k]),
+                              "Header in file": hdr + extra})
+        fc1.dataframe(pd.DataFrame(found), hide_index=True, width="stretch")
+        n_read = len([r for r in res.rows if r.start or r.finish])
+        lines = [f"**{n_read}** rows read from **{mp.get('sheet', res.sheet_name)}**, header row "
+                 f"{mp.get('header_row', '')}" + (" (mapped by hand)" if mp.get("manual") else ""),
+                 f"**{len(res.ignored)}** notes / legend rows ignored",
+                 f"Work week **{ww['label']}**: {ww['reason']}"]
+        if "preds" in mp.get("cols", {}):
+            lines.append(f"Workbook logic: **{fitted}** links fitted to the dates, "
+                         f"**{stt.get('src_logic_problems', 0)}** removed or not found")
+        fc2.markdown("\n".join(f"- {x}" for x in lines))
+        if src_warn:
+            fc2.dataframe(pd.DataFrame([{"ID": str(i[1]), "Task": i[2], "Issue": i[3]} for i in src_warn]),
+                          hide_index=True, width="stretch", height=min(38 * len(src_warn) + 38, 260))
+        fb1, fb2, _ = st.columns([1.2, 1, 2])
+        fb1.download_button("Standardised workbook", exporters.to_standard_xlsx(res),
+                            f"{re.sub(r'[^A-Za-z0-9]+', '_', res.project.name).strip('_')[:60]}_Standard.xlsx",
+                            XLSX, icon=":material/table_view:", width="stretch",
+                            help="Your schedule in the standard layout, with dates resolved. Edit it and upload "
+                                 "it again.")
+        if fb2.toggle("Map columns by hand", value=bool(mapping), key="mp-toggle"):
+            column_mapper(mp)
+
+    render_outputs(res, "xl", ok_head="All dates match the Excel", source_word="Excel", edit_key=edit_key)
+
+
+# =========================================================================== #
+# Flow 2: Document scope ingestion (Gemini) -> Review Gate -> CPM -> exports
+# =========================================================================== #
+WIZARD = ["Upload document", "AI extraction", "Review Gate", "CPM & exports"]
+
+
+def _wizard(current: int, done: int):
+    cells = []
+    for i, label in enumerate(WIZARD, start=1):
+        cls = "on" if i == current else ("done" if i <= done else "")
+        mark = "✓" if (i <= done and i != current) else str(i)
+        cells.append(f'<div class="s {cls}"><span class="n">{mark}</span>{label}</div>')
+    st.markdown('<div class="sc-wiz">' + "".join(cells) + "</div>", unsafe_allow_html=True)
+
+
+def _next_monday() -> dt.date:
+    d = dt.date.today()
+    return d + dt.timedelta(days=(7 - d.weekday()) % 7 or 7)
+
+
+def _reset_doc(sig=None):
+    st.session_state["doc"] = {"sig": sig}
+    for k in [k for k in st.session_state if str(k).startswith("doc-editor")]:
+        st.session_state.pop(k, None)
+
+
+def document_ingestion():
+    from scheduler import extractor   # imported lazily: the Excel converter never needs the AI stack
+
+    S = st.session_state.setdefault("doc", {"sig": None})
+
+    up = st.file_uploader("Scope document", type=["docx", "pdf", "txt", "md"], label_visibility="collapsed",
+                          key="doc-up",
+                          help="Statement of Work, project charter, scope narrative or technical specification. "
+                               "Text-based PDF or Word (.docx); scans are not supported.")
+    if up is None:
+        _wizard(1, 0)
+        st.markdown(
+            "Upload a **Statement of Work**, **charter** or **scope narrative**. Gemini proposes a scope register "
+            "with a citation for every line; **you review and approve it**; the proven CPM engine then builds and "
+            "verifies the baseline. The AI never sets a date or a float value.")
+        if not gemini_key:
+            st.info("Add **GEMINI_API_KEY** in Streamlit secrets (or enter a key in the sidebar) to enable "
+                    "extraction.", icon=":material/key:")
+        return
+
+    data = up.getvalue()
+    sig = hashlib.sha256(data).hexdigest()
+    if S.get("sig") != sig:
+        _reset_doc(sig)
+        S = st.session_state["doc"]
+
+    # ------------------------------ step 1: read ----------------------------- #
+    if "doc" not in S:
+        try:
+            S["doc"] = read_document(data, up.name)
+        except DocumentReadError as exc:
+            _wizard(1, 0)
+            st.error(str(exc), icon=":material/error:")
+            return
+    doc = S["doc"]
+    approved = S.get("approved")
+    step = 4 if approved else (3 if "register" in S else 2)
+    _wizard(step, step - 1)
+
+    c = st.columns(4)
+    for col, (v, lbl) in zip(c, [(f"{doc.word_count:,}", "Words"), (len(doc.segments), "Text segments"),
+                                 (doc.pages if doc.pages else "-", "Pages"), (doc.tables, "Tables")]):
+        col.markdown(f'<div class="sc-fig"><b>{v}</b><span>{lbl}</span></div>', unsafe_allow_html=True)
+    for w in doc.warnings:
+        st.warning(w, icon=":material/warning:")
+    with st.expander("Text as read (segment ids are used as citations)", icon=":material/article:"):
+        st.dataframe(pd.DataFrame([{"Segment": s.sid, "Kind": s.kind, "Text": s.text} for s in doc.segments]),
+                     hide_index=True, width="stretch", height=320,
+                     column_config={"Text": st.column_config.TextColumn(width="large")})
+
+    # ---------------------------- step 2: extract ---------------------------- #
+    if "register" not in S:
+        st.subheader("AI extraction")
+        a1, a2 = st.columns([1, 2])
+        detail = a1.radio("Detail", list(extractor.DETAIL_LEVELS), horizontal=True, key="doc-detail",
+                          format_func=lambda k: {"L2": "Level 2", "L3": "Level 3"}[k],
+                          help="\n\n".join(f"**{k}**: {v}" for k, v in extractor.DETAIL_LEVELS.items()))
+        red = a2.text_input("Confidential terms to redact before sending (comma-separated)", key="doc-redact",
+                            placeholder="e.g. client name, field name, project code",
+                            help="Each term is replaced by [REDACTED-n] in the text sent to Gemini.")
+        st.caption("Only the extracted **text** is sent to the Google Gemini API, not the file. Check that your "
+                   "contract allows processing by a third-party AI service before you extract.")
+        if st.button("Extract scope with Gemini", type="primary", icon=":material/auto_awesome:",
+                     disabled=not gemini_key, key="doc-extract"):
+            terms = [t.strip() for t in red.split(",") if t.strip()]
             try:
-                import anthropic
+                with st.spinner(f"Reading {len(doc.segments)} segments with {gemini_model}…"):
+                    ext = extractor.extract_scope(doc, gemini_key, gemini_model, detail, terms)
+            except extractor.ExtractionError as exc:
+                st.error(str(exc), icon=":material/error:")
+                return
+            reg = extractor.scope_to_register(ext.scope, doc)
+            reg = reg.sort_values("WBS", key=lambda s: s.map(sb.wbs_key)).reset_index(drop=True)
+            S["extraction"] = ext
+            S["register"] = reg
+            st.rerun()
+        if not gemini_key:
+            st.caption("Extraction is disabled until a Gemini API key is available.")
+        return
 
-                client = anthropic.Anthropic(api_key=api_key)
-                csv_text = exporters.to_csv(res).decode("utf-8", "ignore")
-                prompt = (
-                    "You are a senior planning engineer (PMI-SP) reviewing a Level 2 schedule converted from "
-                    "Excel for MS Project. Dates are fixed by the client; logic was inferred to reproduce them. "
-                    "In under 300 words, flag logic that looks unrealistic, missing hand-overs, excessive "
-                    "leads/lags, and DCMA-14 concerns, then list the top 5 improvements. Be concise.\n\n"
-                    f"QA stats: {stt}\n\nSchedule CSV:\n{csv_text}")
-                msg = client.messages.create(model=st.secrets.get("ANTHROPIC_MODEL", "claude-sonnet-5-5"),
-                                             max_tokens=1200, messages=[{"role": "user", "content": prompt}])
-                st.markdown("".join(b.text for b in msg.content if getattr(b, "type", "") == "text"))
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"AI review failed: {exc}")
+    ext = S["extraction"]
+    scope = ext.scope
+
+    # -------------------------- step 3: review gate -------------------------- #
+    if not approved:
+        st.subheader("Review Gate")
+        info = [f"**{len(scope.items)}** items proposed by `{ext.model}` ({ext.detail}) in {ext.seconds:g} s",
+                f"Project: **{esc(scope.project_name)}**"]
+        if ext.input_tokens:
+            info.append(f"Tokens: {ext.input_tokens:,} in / {ext.output_tokens or 0:,} out")
+        if ext.redactions:
+            info.append(f"{ext.redactions} confidential term(s) redacted before sending")
+        st.markdown(" · ".join(info))
+        if scope.open_questions or scope.exclusions or ext.notes:
+            with st.expander(f"Open questions ({len(scope.open_questions)}), exclusions ({len(scope.exclusions)}), "
+                             f"normalisation notes ({len(ext.notes)})", icon=":material/help:"):
+                if scope.open_questions:
+                    st.markdown("**Open questions for the planner**\n" +
+                                "\n".join(f"- {esc(q)}" for q in scope.open_questions))
+                if scope.exclusions:
+                    st.markdown("**Exclusions stated in the document**\n" +
+                                "\n".join(f"- {esc(x)}" for x in scope.exclusions))
+                if ext.notes:
+                    st.markdown("**Automatic corrections**\n" + "\n".join(f"- {esc(n)}" for n in ext.notes))
+
+        st.caption("Edit any cell, add rows at the bottom, untick **Include** to drop a row. Predecessors use refs: "
+                   "`A010, A020 SS+5d, A030 FF`. Rows the planner adds, or whose quote was not found in the "
+                   "document, need a **Planner note**.")
+        edited = st.data_editor(
+            S["register"], key="doc-editor", num_rows="dynamic", hide_index=True, width="stretch", height=520,
+            column_order=sb.REGISTER_COLUMNS,
+            disabled=["Confidence", "Citation", "Source", "Evidence", "Assumption"],
+            column_config={
+                "Include": st.column_config.CheckboxColumn(width="small", default=True),
+                "Ref": st.column_config.TextColumn(width="small", required=True),
+                "WBS": st.column_config.TextColumn(width="small", required=True),
+                "Activity": st.column_config.TextColumn(width="large", required=True),
+                "Type": st.column_config.SelectboxColumn(options=sb.TYPES, required=True, default="Task"),
+                "Duration (days)": st.column_config.NumberColumn(min_value=0, max_value=5000, step=1,
+                                                                 help="Working days. Milestones 0."),
+                "Predecessors": st.column_config.TextColumn(help="e.g. A010, A020 SS+5d, A030 FF"),
+                "Basis": st.column_config.SelectboxColumn(options=["Stated", "Estimated", "Planner", "-"],
+                                                          default="Planner"),
+                "Confidence": st.column_config.ProgressColumn(min_value=0.0, max_value=1.0, format="percent",
+                                                              width="small"),
+                "Citation": st.column_config.TextColumn(width="small",
+                                                        help="Verified: quote found in the cited segment. "
+                                                             "Relocated: found in another segment (corrected). "
+                                                             "Unverified: not found - check it."),
+                "Source": st.column_config.TextColumn(width="small"),
+                "Evidence": st.column_config.TextColumn(width="large"),
+                "Assumption": st.column_config.TextColumn(width="medium"),
+                "Planner note": st.column_config.TextColumn(width="medium"),
+            })
+
+        v = sb.validate_register(edited, max_lead_days=0)
+        vs = v.stats
+        m = st.columns(5)
+        for col, (val, lbl) in zip(m, [(vs.get("included", 0), "Rows included"), (len(v.errors), "Blocking errors"),
+                                       (len(v.warnings), "Warnings"), (vs.get("unverified", 0), "Unverified citations"),
+                                       (vs.get("estimated", 0), "Estimated durations")]):
+            col.markdown(f'<div class="sc-fig"><b>{val}</b><span>{lbl}</span></div>', unsafe_allow_html=True)
+        st.write("")
+        if v.errors or v.warnings:
+            findings = pd.DataFrame([{"Severity": "Error", "Ref": r, "Finding": msg} for r, msg in v.errors] +
+                                    [{"Severity": "Warning", "Ref": r, "Finding": msg} for r, msg in v.warnings])
+            st.dataframe(findings, hide_index=True, width="stretch", height=min(38 * len(findings) + 38, 300),
+                         column_config={"Finding": st.column_config.TextColumn(width="large")})
+        else:
+            st.success("No blocking errors or warnings.", icon=":material/check_circle:")
+
+        st.markdown("##### Approve the scope register")
+        r1, r2, r3 = st.columns([1.2, 1.2, 1])
+        reviewer = r1.text_input("Reviewer name", key="doc-reviewer")
+        role = r2.text_input("Role", key="doc-role", placeholder="e.g. Lead Planner")
+        confirm = st.checkbox("I have reviewed every included row against the source document and accept "
+                              "estimated durations and inferred logic as the planning basis.", key="doc-confirm")
+        can = v.ok and confirm and reviewer.strip()
+        if r3.button("Approve scope register", type="primary", icon=":material/verified:", disabled=not can,
+                     key="doc-approve", width="stretch"):
+            frozen = edited.copy().reset_index(drop=True)
+            meta = {"Source document": up.name, "Document SHA-256": sig, "Extraction model": ext.model,
+                    "Detail level": ext.detail, "Reviewer": reviewer.strip(), "Role": role.strip(),
+                    "Approved (UTC)": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                    "Rows included": vs.get("included", 0), "Warnings accepted": len(v.warnings)}
+            S["approved"] = {"df": frozen, "meta": meta, "hash": sb.register_hash(frozen)}
+            st.rerun()
+        if not v.ok:
+            st.caption("Approval is locked until every blocking error is fixed.")
+        b1, _ = st.columns([1, 4])
+        if b1.button("Discard and extract again", icon=":material/restart_alt:", key="doc-reextract"):
+            _reset_doc(sig)
+            st.rerun()
+        return
+
+    # ---------------------- step 4: CPM logic + exports ---------------------- #
+    reg, meta = approved["df"], approved["meta"]
+    st.subheader("CPM schedule")
+    st.markdown(f"Register approved by **{esc(meta['Reviewer'])}**"
+                f"{' (' + esc(meta['Role']) + ')' if meta.get('Role') else ''} on {meta['Approved (UTC)']} UTC · "
+                f"SHA-256 `{approved['hash'][:16]}…`")
+    with st.expander("Approved scope register (locked)", icon=":material/lock:"):
+        st.dataframe(reg, hide_index=True, width="stretch", height=320)
+        if st.button("Reopen review", icon=":material/edit:", key="doc-reopen",
+                     help="Unlock the register for changes. The approval and schedule are withdrawn."):
+            S.pop("approved", None)
+            S.pop("generated", None)
+            st.rerun()
+
+    default_start = _next_monday()
+    if scope.project_start_date:
+        try:
+            default_start = dt.date.fromisoformat(scope.project_start_date[:10])
+        except ValueError:
+            pass
+    doc_week = work_week or (scope.work_week_days if scope.work_week_days in (5, 6, 7) else 5)
+    with st.expander("Project settings", icon=":material/tune:", expanded=not S.get("generated")):
+        p1, p2, p3 = st.columns([2, 1.2, 1.2])
+        name = p1.text_input("Project name", scope.project_name or up.name.rsplit(".", 1)[0], key="doc-pname")
+        start = p2.date_input("Start (NTP)", default_start, format="DD/MM/YYYY", key="doc-start")
+        week_lbl = {5: "Mon–Fri", 6: "Mon–Sat", 7: "Mon–Sun"}
+        p3.text_input("Work week", f"{week_lbl[doc_week]} · {hours:g} h/day", disabled=True, key="doc-week",
+                      help="Set in the sidebar (Calendar). Auto-detect uses the document's stated week, else Mon–Fri.")
+        auto_cal = calendar_name_for(name, POLICY)
+        cal_name = st.text_input("Calendar name", auto_cal, max_chars=51, key=f"doc-cal-{auto_cal}")
+
+    if not S.get("generated"):
+        if st.button("Generate CPM schedule", type="primary", icon=":material/account_tree:", key="doc-generate"):
+            S["generated"] = True
+            st.rerun()
+        return
+
+    settings = sb.BuildSettings(project_name=name, start=start, work_week=doc_week, hours_per_day=hours,
+                                holidays=holidays, calendar_name=cal_name, policy=dict(SIDEBAR_POLICY))
+    try:
+        with st.spinner("Building and verifying the CPM network…"):
+            out = sb.build_schedule(reg, settings)
+    except sb.BuildError as exc:
+        st.error(str(exc), icon=":material/error:")
+        if exc.details:
+            st.dataframe(pd.DataFrame({"Detail": exc.details}), hide_index=True, width="stretch")
+        st.caption("Reopen the review to correct the register.")
+        return
+    res = out.res
+    with st.expander("Build log", icon=":material/receipt_long:"):
+        st.markdown("\n".join(f"- {x}" for x in out.log))
+
+    ww = res.info["work_week"]
+    chips = "".join(f'<span class="sc-chip">{esc(c)}</span>' for c in
+                    [up.name, f"{len(reg)} register rows", f'{ww["label"]} · {ww["hours_per_day"]:g} h/day'])
+    st.markdown(f'<div class="sc-proj"><h2>{esc(res.project.name)}</h2><div>{chips}</div></div>',
+                unsafe_allow_html=True)
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", res.project.name).strip("_")[:60] or "Schedule"
+    extra = [("Approval record", sb.approval_record_xlsx(reg, meta), f"{safe}_Scope_Register_Approved.xlsx", XLSX,
+              "Approved register, reviewer, timestamp and SHA-256 (audit trail)."),
+             ("Approval record JSON", sb.approval_record_json(reg, meta), f"{safe}_Scope_Register_Approved.json",
+              "application/json", "Machine-readable approval record with the register hash."),
+             ("Standard workbook", out.workbook, f"{safe}_Standard.xlsx", XLSX,
+              "The standard-layout workbook fed to the engine. Re-upload it in the Excel converter tab.")]
+    render_outputs(res, "doc", ok_head="Zero-day variance: engine matches the register",
+                   source_word="register", edit_key=None, extra_downloads=extra)
+
+
+# =========================================================================== #
+# Page
+# =========================================================================== #
+tab_xl, tab_doc = st.tabs([":material/table_view: Excel schedule converter",
+                           ":material/description: Document scope ingestion"], key="main-tabs")
+with tab_xl:
+    excel_converter()
+with tab_doc:
+    document_ingestion()
 
 footer()

@@ -3,6 +3,11 @@
 Upload **any Excel schedule** and get files that open in **Microsoft Project** and **Primavera P6**
 with the firm's scheduling policy applied and **every date verified against the Excel**.
 
+**New in Phase 1 (AutoSchedule Engine): Document scope ingestion.** Upload a Statement of Work, charter or scope
+narrative (`.docx`, text-based `.pdf`, `.txt`, `.md`). Google Gemini proposes a scope register with a citation for
+every line; a planner reviews and approves it in the **Review Gate**; the same proven CPM engine then builds,
+verifies (zero-day variance) and exports the baseline, with a **DCMA-14** report. The AI never sets a date.
+
 Live app: `https://schedule-converter.streamlit.app` (Streamlit Community Cloud)
 
 ---
@@ -40,7 +45,7 @@ re-verify, a Gantt preview with the critical path, and an optional AI planning r
 ## Repository layout
 
 ```
-app.py                  Streamlit user interface
+app.py                  Streamlit user interface (Excel converter tab + Document scope ingestion tab)
 firm_policy.json        Firm scheduling policy (edit to change defaults)
 scheduler/
   reader.py             Sheet / header / column detection, dates, week & Gantt parsing
@@ -49,10 +54,16 @@ scheduler/
   cpm.py                MS Project-equivalent forward/backward pass
   engine.py             Orchestration + quality checks
   exporters.py          CSV, MS Project XML, P6 XER, QA workbook
+  doc_reader.py         NEW  .docx / .pdf / .txt text extraction into cited segments (P12, T2.R5, PG3.4)
+  extractor.py          NEW  Gemini structured extraction (response_schema=ProjectScope) + citation checks
+  scope_builder.py      NEW  Review Gate validation, deterministic dates, bridge into engine.convert
+  dcma.py               NEW  DCMA 14-point assessment (both tabs) + Excel report
 tests/test_engine.py    Regression tests on synthetic schedules (pytest)
+tests/test_scope_pipeline.py  NEW  Document pipeline tests (mocked Gemini, no network)
 requirements.txt        Python packages (pinned)
 packages.txt            Java runtime for the P6 XER export (Streamlit Cloud installs it)
 .streamlit/config.toml  Theme
+.streamlit/secrets.toml.example  NEW  Template for local secrets (copy to secrets.toml; never commit it)
 ```
 
 ## Update the GitHub repository (Temmydesign/schedule-converter)
@@ -71,6 +82,15 @@ The simplest way, in the browser:
 > If client confidentiality matters, set the repository to **Private** (Settings › General ›
 > Danger Zone › Change visibility). Streamlit Community Cloud can deploy from private repos, and
 > you can restrict who can open the app under **App settings › Sharing**.
+
+### Required for Document scope ingestion: Gemini API key
+In share.streamlit.io › app › **Settings › Secrets**, add:
+```toml
+GEMINI_API_KEY = "your-google-ai-studio-key"
+# GEMINI_MODEL = "gemini-2.5-flash"
+```
+Without a key the Excel converter works as before and the document tab shows extraction as disabled.
+For local testing you can paste a key into the sidebar field instead (kept only for that browser session).
 
 ### Optional: AI planning review
 In share.streamlit.io › app › **Settings › Secrets**, add:
@@ -96,6 +116,10 @@ pytest -q
 Edit `firm_policy.json`, e.g. `"max_lead_weeks": 0` to forbid leads, `"close_open_ends": true`,
 `"completion_milestone_label_aliases"` to rename specific completion milestones (e.g. `MS` → `Programme Milestones`),
 or `working_days` / `hours_per_day` for a 6-day site calendar.
+
+Optional DCMA-14 thresholds (defaults shown; add only to change them):
+`"dcma_threshold_pct": 5`, `"dcma_high_float_days": 44`, `"dcma_high_duration_days": 44`,
+`"dcma_fs_min_pct": 90`, `"dcma_cpt_delay_days": 600`.
 
 ---
 A Naphtali PM Group product. © 2026

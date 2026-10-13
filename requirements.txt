@@ -7,5 +7,10 @@ plotly==7.1.0
 # Primavera P6 .XER export (needs Java - see packages.txt). Remove these 2 lines and packages.txt to disable.
 mpxj==16.10.0
 JPype1==1.7.1
+# Document scope ingestion (Phase 1): Gemini structured extraction + Word/PDF text reading
+google-genai==2.30.0
+pydantic>=2.9,<3
+python-docx==1.2.0
+pypdf==5.9.0
 # Optional AI review (only used if ANTHROPIC_API_KEY is set in Streamlit secrets)
 anthropic
