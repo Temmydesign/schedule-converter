@@ -148,9 +148,10 @@ def test_extract_structured_output_redaction_and_normalisation():
     doc = read_document(make_docx(), "sow.docx")
     models = _Models(_scope())
     e = ex.extract_scope(doc, "k", detail="L2", redact_terms=["Water Tank"], client=SimpleNamespace(models=models))
-    _, contents, config = models.calls[0]
-    assert config.response_schema is ex.ProjectScope and config.temperature == 0.0
-    assert config.response_mime_type == "application/json"
+    model, contents, config = models.calls[0]
+    assert model == "gemini-3.8-flash" and e.model == "gemini-3.8-flash"      # auto: newest free Flash first
+    assert config.response_schema is ex.ProjectScope and config.response_mime_type == "application/json"
+    assert config.temperature is None and config.thinking_config.thinking_level is not None   # Gemini 3 rules
     assert "Water Tank" not in contents and "[REDACTED-1]" in contents and e.redactions == 1
     items = {it.ref: it for it in e.scope.items}
     assert "A030-2" in items                                      # duplicate ref renamed
@@ -167,6 +168,71 @@ def test_extract_output_limit_is_reported():
     doc = read_document(make_docx(), "sow.docx")
     with pytest.raises(ex.ExtractionError, match="too large"):
         ex.extract_scope(doc, "k", client=SimpleNamespace(models=_Models(_scope(), finish="MAX_TOKENS")))
+
+
+def _error_client(fail: dict, scope, listed=None):
+    """fail: {model: [codes to raise in order]}; afterwards the model succeeds. listed: model list or None."""
+    from google.genai import errors
+    calls = []
+
+    class Models:
+        def list(self):
+            if listed is None:
+                raise RuntimeError("listing not allowed")
+            return [SimpleNamespace(name=f"models/{m}", supported_actions=["generateContent"]) for m in listed]
+
+        def generate_content(self, model, contents, config):
+            calls.append((model, config))
+            queue = fail.get(model, [])
+            if queue:
+                code = queue.pop(0)
+                exc = errors.ClientError.__new__(errors.ClientError)
+                exc.code, exc.message, exc.status, exc.details = code, f"HTTP {code}", "", {}
+                raise exc
+            return SimpleNamespace(parsed=scope, text=None, usage_metadata=None,
+                                   candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))])
+    return SimpleNamespace(models=Models()), calls
+
+
+def test_model_fallback_on_404_like_a_new_free_tier_key(monkeypatch):
+    """Field case 13-Oct-2026: gemini-2.5-flash returns 404 for a new free-tier key."""
+    monkeypatch.setattr(ex.time, "sleep", lambda s: None)
+    doc = read_document(make_docx(), "sow.docx")
+    client, calls = _error_client({"gemini-2.5-flash": [404]}, _scope())
+    e = ex.extract_scope(doc, "k", model="gemini-2.5-flash", client=client)
+    assert [m for m, _ in calls] == ["gemini-2.5-flash", "gemini-3.8-flash"]
+    assert e.model == "gemini-3.8-flash" and any("not available to this key" in n for n in e.notes)
+    assert calls[0][1].temperature == 0.0 and calls[0][1].seed == 7        # Gemini 2.x rules on the first try
+
+
+def test_listed_models_restrict_candidates_and_quota_falls_through(monkeypatch):
+    monkeypatch.setattr(ex.time, "sleep", lambda s: None)
+    doc = read_document(make_docx(), "sow.docx")
+    client, calls = _error_client({"gemini-3.6-flash": [429, 429, 429]}, _scope(),
+                                  listed=["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash-tts"])
+    e = ex.extract_scope(doc, "k", client=client)
+    assert [m for m, _ in calls] == ["gemini-3.6-flash"] * 3 + ["gemini-3.5-flash-lite"]
+    assert e.model == "gemini-3.5-flash-lite"
+
+
+def test_unsupported_setting_400_steps_to_json_schema(monkeypatch):
+    monkeypatch.setattr(ex.time, "sleep", lambda s: None)
+    doc = read_document(make_docx(), "sow.docx")
+    client, calls = _error_client({"gemini-3.8-flash": [400]}, _scope())
+    e = ex.extract_scope(doc, "k", client=client)
+    assert e.model == "gemini-3.8-flash"
+    assert calls[0][1].response_schema is ex.ProjectScope and calls[1][1].response_json_schema is not None
+
+
+def test_bad_key_and_all_models_missing_give_clear_messages(monkeypatch):
+    monkeypatch.setattr(ex.time, "sleep", lambda s: None)
+    doc = read_document(make_docx(), "sow.docx")
+    client, _ = _error_client({"gemini-3.8-flash": [403]}, _scope())
+    with pytest.raises(ex.ExtractionError, match="key was rejected"):
+        ex.extract_scope(doc, "k", client=client)
+    client, _ = _error_client({m: [404] for m in ex.MODEL_PREFERENCE}, _scope())
+    with pytest.raises(ex.ExtractionError, match="None of these Gemini models"):
+        ex.extract_scope(doc, "k", client=client)
 
 
 def test_gemini_schema_has_no_defaults():
