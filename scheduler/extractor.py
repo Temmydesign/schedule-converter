@@ -6,7 +6,8 @@ The model only *reads and classifies*: it proposes scope items, a WBS position, 
 basis and candidate logic, each with a citation (segment id + verbatim quote) to the source
 document. It never produces dates. Everything it returns is:
 
-1. parsed into the ``ProjectScope`` Pydantic schema (``response_schema=ProjectScope``),
+1. parsed into the ``ProjectScope`` Pydantic schema (``response_schema=ProjectScope``; JSON-schema
+   form as a fallback for models that reject it),
 2. normalised deterministically (unique refs, milestone durations, no SF / leads),
 3. citation-checked against the document text (``verify_citations``), and
 4. put in front of a planner in the Review Gate, who must approve it before any CPM logic runs.
@@ -29,10 +30,20 @@ from pydantic import BaseModel, Field, ValidationError
 from .doc_reader import DocumentText, normalise_for_match
 from .scope_builder import REGISTER_COLUMNS, format_predecessors
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "auto"          # pick the best Flash model this API key can use (see candidate_models)
+# Preference order, newest first. All are Flash-class models offered on the Gemini API free tier;
+# availability differs by key/project (e.g. gemini-2.5-flash is limited to projects that used it before),
+# so the live model list for the key decides what is actually tried.
+MODEL_PREFERENCE = [
+    "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3-flash-preview",
+    "gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+]
+_NOT_TEXT = ("tts", "image", "live", "embedding", "audio", "robotics", "computer-use", "transcribe", "omni",
+             "banana", "veo", "imagen", "lyria")
 MAX_OUTPUT_TOKENS = 65_536
-THINKING_BUDGET = 4_096          # small reasoning budget: better structure, bounded cost and latency
-RETRIES = 3
+THINKING_BUDGET_25 = 4_096       # Gemini 2.x: small reasoning budget (tokens)
+RETRIES = 3                      # per model, for 429 / 5xx / network errors
+MAX_MODELS_TRIED = 4
 
 
 # --------------------------------------------------------------------------- #
@@ -166,55 +177,148 @@ def _client(api_key: str):
     return genai.Client(api_key=api_key)
 
 
+# --------------------------------------------------------------------------- #
+# Model selection (models are retired and re-gated over time: never trust one hard-coded name)
+# --------------------------------------------------------------------------- #
+def available_models(api_key: str = "", client=None) -> Optional[list]:
+    """Text-generation Gemini models this key can call, or None if the list could not be read."""
+    try:
+        client = client or _client(api_key)
+        names = []
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").split("/")[-1]
+            actions = getattr(m, "supported_actions", None) or []
+            if not name.startswith("gemini") or any(t in name for t in _NOT_TEXT):
+                continue
+            if actions and "generateContent" not in actions:
+                continue
+            names.append(name)
+        return names or None
+    except Exception:  # noqa: BLE001 - listing is best effort
+        return None
+
+
+def candidate_models(preferred: Optional[str], available: Optional[list]) -> list:
+    """Order of models to try: the configured one (if any), then the preference list, then other Flash models.
+    When the key's model list is known, only models on it are tried."""
+    order = []
+
+    def add(m):
+        if not m or any(t in m for t in _NOT_TEXT):
+            return
+        if m not in order and (available is None or m in available or m == preferred):
+            order.append(m)
+
+    if preferred and preferred.lower() != "auto":
+        add(preferred.strip())
+    for m in MODEL_PREFERENCE:
+        add(m)
+    for m in available or []:
+        if "flash" in m and "lite" not in m:
+            add(m)
+    return order[:MAX_MODELS_TRIED] if available is None else order
+
+
+def _is_gen3(model: str) -> bool:
+    return bool(re.match(r"^gemini-([3-9]|\d{2,})", model))
+
+
+def _config(types, model: str, variant: int):
+    """Generation config per model family.
+
+    Gemini 3.x: thinking_level, default temperature (Google advises against lowering it on 3.x: looping risk).
+    Gemini 2.x: temperature 0 + fixed seed + thinking_budget.
+    variant 0 = Pydantic response_schema; 1 = JSON-schema form; 2 = JSON schema, no thinking/token settings
+    (the fallbacks only run if a model rejects a setting with HTTP 400).
+    """
+    kw = {"system_instruction": SYSTEM_INSTRUCTION, "response_mime_type": "application/json"}
+    if variant == 0:
+        kw["response_schema"] = ProjectScope
+    else:
+        kw["response_json_schema"] = ProjectScope.model_json_schema()
+    if variant < 2:
+        kw["max_output_tokens"] = MAX_OUTPUT_TOKENS
+        if _is_gen3(model):
+            kw["thinking_config"] = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+        else:
+            kw["temperature"] = 0.0
+            kw["seed"] = 7
+            kw["thinking_config"] = types.ThinkingConfig(thinking_budget=THINKING_BUDGET_25)
+    elif not _is_gen3(model):
+        kw["temperature"] = 0.0
+    return types.GenerateContentConfig(**kw)
+
+
+def _sleep_backoff(attempt: int):
+    time.sleep(min(30, 4 * 2 ** (attempt - 1)) + random.random())
+
+
+def _call(client, errors, types, model: str, prompt: str):
+    """One model: retry transient errors, step through config variants on 400.
+    Returns (response, None) or (None, (code, exception))."""
+    variant = 0
+    attempt = 0
+    while variant <= 2:
+        attempt += 1
+        try:
+            return client.models.generate_content(model=model, contents=prompt,
+                                                  config=_config(types, model, variant)), None
+        except errors.ClientError as exc:                       # 4xx
+            code = getattr(exc, "code", None)
+            if code == 429 and attempt < RETRIES:
+                _sleep_backoff(attempt)
+                continue
+            if code == 400 and variant < 2:                      # a setting this model does not accept
+                variant += 1
+                attempt = 0
+                continue
+            return None, (code, exc)
+        except errors.ServerError as exc:                       # 5xx: transient
+            if attempt < RETRIES:
+                _sleep_backoff(attempt)
+                continue
+            return None, (getattr(exc, "code", 500) or 500, exc)
+        except Exception as exc:  # noqa: BLE001 - network, DNS, TLS
+            if attempt < RETRIES:
+                time.sleep(2 * attempt)
+                continue
+            return None, ("network", exc)
+    return None, (400, None)  # pragma: no cover
+
+
 def extract_scope(doc: DocumentText, api_key: str, model: str = DEFAULT_MODEL, detail: str = "L2",
                   redact_terms: Optional[list] = None, client=None) -> Extraction:
-    """Call Gemini once with structured output; retry transient errors. Raises ExtractionError."""
+    """Call Gemini with structured output. Picks a model the key can use, falls back on 404 / quota
+    exhaustion / unsupported settings, retries transient errors. Raises ExtractionError."""
     if not api_key and client is None:
         raise ExtractionError("No Gemini API key. Add GEMINI_API_KEY to Streamlit secrets or enter it in the sidebar.")
     from google.genai import errors, types
 
     text, n_red = redact(doc.as_prompt_text(), redact_terms or [])
     prompt = build_prompt(doc, detail, text)
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_INSTRUCTION,
-        response_mime_type="application/json",
-        response_schema=ProjectScope,
-        temperature=0.0,
-        seed=7,
-        max_output_tokens=MAX_OUTPUT_TOKENS,
-        thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET),
-    )
     client = client or _client(api_key)
+    candidates = candidate_models(model, available_models(client=client))
+    if not candidates:
+        raise ExtractionError("This API key has no Gemini text model available. Check the key's project in "
+                              "Google AI Studio.")
 
     t0 = time.time()
-    last_exc = None
-    resp = None
-    for attempt in range(1, RETRIES + 1):
-        try:
-            resp = client.models.generate_content(model=model, contents=prompt, config=config)
+    resp, used, tried = None, None, []
+    for m in candidates:
+        resp, err = _call(client, errors, types, m, prompt)
+        if resp is not None:
+            used = m
             break
-        except errors.ClientError as exc:                 # 4xx
-            code = getattr(exc, "code", None)
-            if code == 429 and attempt < RETRIES:          # rate limit: back off and retry
-                last_exc = exc
-                time.sleep(min(30, 4 * 2 ** (attempt - 1)) + random.random())
-                continue
+        code, exc = err
+        tried.append((m, code))
+        if code in (401, 403):
             raise ExtractionError(_client_error_message(exc)) from exc
-        except errors.ServerError as exc:                 # 5xx: transient
-            last_exc = exc
-            if attempt < RETRIES:
-                time.sleep(min(30, 4 * 2 ** (attempt - 1)) + random.random())
-                continue
-            raise ExtractionError(f"Gemini service unavailable after {RETRIES} attempts ({exc}). "
-                                  "Try again in a few minutes.") from exc
-        except Exception as exc:  # noqa: BLE001 - network, DNS, TLS
-            last_exc = exc
-            if attempt < RETRIES:
-                time.sleep(2 * attempt)
-                continue
-            raise ExtractionError(f"Could not reach the Gemini API: {exc}") from exc
-    if resp is None:  # pragma: no cover
-        raise ExtractionError(f"Gemini call failed: {last_exc}")
+        if code in (404, 429, 400) or (isinstance(code, int) and code >= 500):
+            continue                                            # try the next model
+        raise ExtractionError(_client_error_message(exc) if exc is not None else
+                              f"Could not reach the Gemini API ({code}).") from exc
+    if resp is None:
+        raise ExtractionError(_all_failed_message(tried))
 
     finish = _finish_reason(resp)
     if finish == "MAX_TOKENS":
@@ -226,6 +330,7 @@ def extract_scope(doc: DocumentText, api_key: str, model: str = DEFAULT_MODEL, d
     scope = getattr(resp, "parsed", None)
     if not isinstance(scope, ProjectScope):
         raw = getattr(resp, "text", None) or ""
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
         try:
             scope = ProjectScope.model_validate_json(raw)
         except (ValidationError, ValueError) as exc:
@@ -235,12 +340,28 @@ def extract_scope(doc: DocumentText, api_key: str, model: str = DEFAULT_MODEL, d
         raise ExtractionError("No scope items were found in the document.")
 
     usage = getattr(resp, "usage_metadata", None)
-    ext = Extraction(scope=scope, model=model, detail=detail, seconds=round(time.time() - t0, 1),
+    ext = Extraction(scope=scope, model=used, detail=detail, seconds=round(time.time() - t0, 1),
                      input_tokens=getattr(usage, "prompt_token_count", None) if usage else None,
                      output_tokens=getattr(usage, "candidates_token_count", None) if usage else None,
                      redactions=n_red)
+    for m, code in tried:
+        why = {404: "not available to this key", 429: "quota/rate limit reached",
+               400: "rejected the request settings"}.get(code, f"error {code}")
+        ext.notes.append(f"Model {m} skipped ({why}); used {used}.")
     ext.notes.extend(normalise_scope(scope))
     return ext
+
+
+def _all_failed_message(tried: list) -> str:
+    codes = {c for _, c in tried}
+    names = ", ".join(m for m, _ in tried)
+    if codes == {429}:
+        return (f"Free-tier quota or rate limit reached on every model tried ({names}). Wait a minute and retry; "
+                "if the daily quota is used up it resets at midnight Pacific Time (09:00 Lagos).")
+    if codes == {404}:
+        return (f"None of these Gemini models is available to this API key: {names}. Remove GEMINI_MODEL from "
+                "the secrets (or set it to \"auto\") and check the key's project in Google AI Studio.")
+    return "Gemini extraction failed on every model tried: " + "; ".join(f"{m} ({c})" for m, c in tried)
 
 
 def _finish_reason(resp) -> Optional[str]:
@@ -258,7 +379,7 @@ def _client_error_message(exc) -> str:
     if code in (401, 403):
         return "The Gemini API key was rejected (401/403). Check GEMINI_API_KEY."
     if code == 404:
-        return "The Gemini model was not found (404). Check GEMINI_MODEL in secrets."
+        return "The Gemini model was not found (404) for this API key."
     if code == 429:
         return "Gemini rate limit or quota exceeded (429). Wait a minute, or check the quota on the API key."
     if code == 400:
