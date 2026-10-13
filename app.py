@@ -198,7 +198,7 @@ with st.sidebar:
 
     st.header("AI extraction")
     secret_key = _secret("GEMINI_API_KEY")
-    gemini_model = _secret("GEMINI_MODEL") or "gemini-2.5-flash"
+    gemini_model = (_secret("GEMINI_MODEL") or "auto").strip()
     with st.expander("Gemini", icon=":material/key:", expanded=not secret_key):
         if secret_key:
             st.success("API key loaded from Streamlit secrets.", icon=":material/lock:")
@@ -209,7 +209,21 @@ with st.sidebar:
                                             "In production set GEMINI_API_KEY in Streamlit secrets.")
             if not gemini_key:
                 st.caption("No key: document extraction is disabled. The Excel converter works without it.")
-        st.caption(f"Model: `{gemini_model}`")
+        if gemini_model.lower() == "auto":
+            st.caption("Model: **auto** (best Flash model this key can use; falls back automatically)")
+        else:
+            st.caption(f"Model: `{gemini_model}` (falls back automatically if unavailable)")
+        if gemini_key and st.button("Check models for this key", icon=":material/fact_check:",
+                                    key="gemini-check-models", width="stretch"):
+            from scheduler import extractor as _ex
+            names = _ex.available_models(gemini_key)
+            if names is None:
+                st.error("Could not list models. Check the key and the network.", icon=":material/error:")
+            else:
+                order = _ex.candidate_models(gemini_model, names)
+                st.markdown("**Will try, in order:**\n" + "\n".join(f"{i}. `{m}`" for i, m in enumerate(order[:6], 1)))
+                with st.popover(f"All {len(names)} text models on this key"):
+                    st.markdown("\n".join(f"- `{m}`" for m in names))
     st.caption("Files are never stored.")
 
 holidays = []
@@ -706,7 +720,7 @@ def document_ingestion():
                      disabled=not gemini_key, key="doc-extract"):
             terms = [t.strip() for t in red.split(",") if t.strip()]
             try:
-                with st.spinner(f"Reading {len(doc.segments)} segments with {gemini_model}…"):
+                with st.spinner(f"Reading {len(doc.segments)} segments with Gemini…"):
                     ext = extractor.extract_scope(doc, gemini_key, gemini_model, detail, terms)
             except extractor.ExtractionError as exc:
                 st.error(str(exc), icon=":material/error:")

@@ -87,9 +87,12 @@ The simplest way, in the browser:
 In share.streamlit.io › app › **Settings › Secrets**, add:
 ```toml
 GEMINI_API_KEY = "your-google-ai-studio-key"
-# GEMINI_MODEL = "gemini-2.5-flash"
+# GEMINI_MODEL = "auto"   # default; or a model id such as "gemini-3.8-flash"
 ```
 Without a key the Excel converter works as before and the document tab shows extraction as disabled.
+With `auto` the app asks Google which models the key can use and picks the newest Flash model, falling back
+automatically on 404 (model not available to the key), quota/rate limits (429) or unsupported settings (400).
+Free-tier keys work. Use **Check models for this key** in the sidebar to see the order it will try.
 For local testing you can paste a key into the sidebar field instead (kept only for that browser session).
 
 ### Optional: AI planning review
